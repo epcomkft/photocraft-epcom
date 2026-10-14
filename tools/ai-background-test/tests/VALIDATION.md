@@ -43,3 +43,24 @@ node --experimental-vm-modules tools/ai-background-test/tests/ui-flow.cjs
 ```
 
 The runtime folder has no npm build step or additional runtime package dependency.
+
+
+## v6 startup regression — 2026-10-14
+
+- Direct read-only HTTP inspection of the deployed EPCOM page confirmed:
+  `app.js?v=5` returned `application/javascript`; all three `.mjs?v=5` helpers
+  returned HTTP 200 without a Content-Type header. This prevents browser module
+  evaluation before the file change handler is installed.
+- The v6 distribution is a single classic `app.js`. It is checked against its
+  source modules using `node tools/ai-background-test/build.mjs --check`.
+- Four startup regressions cover a distribution with no local module requests,
+  missing script, stalled/late startup, and preserving application errors after
+  successful initialization. Run with the optional JSDOM test dependency:
+  `node --test tools/ai-background-test/tests/startup.test.cjs`.
+- `ui-flow.cjs` now executes the actual classic distribution with **no local module
+  loader**. It verifies startup readiness, image import, enabled run button,
+  processing locks, inference orchestration, alpha export, correction/undo,
+  cancellation and original-resolution output.
+- The matting algorithms and pinned models are unchanged. Browser WebGPU execution
+  still requires verification on an actual supported browser/driver; these DOM
+  tests are not reported as a GPU or screenshot test.

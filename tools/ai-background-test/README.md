@@ -1,4 +1,4 @@
-# PhotoCraft background removal — v5
+# PhotoCraft background removal — v6
 
 Browser-only background-removal test module. It stays separate from PhotoCraft's
 native Rust application. Images are processed locally; model files are downloaded,
@@ -41,23 +41,47 @@ locked grey background bands around hair into the exported image.
 
 ## Install / update
 
-Serve over HTTPS, for example at `/admin/photocraft-ai-test/`. Replace/upload **all
-six runtime files together**:
+Serve over HTTPS, for example at `/admin/photocraft-ai-test/`. A fresh install
+requires only these **three runtime files**:
 
 ```
 index.html
 app.js
 style.css
-matting-core.mjs
-matting-engine.mjs
-edge-colors.mjs
 ```
 
-`sam2.js` is no longer required by v5.
-The server must serve `.mjs` as JavaScript (`text/javascript` or
-`application/javascript`). All local module and stylesheet references use `v=5`
-cache keys. The header should show **PhotoCraft · háttéreltávolítás v5** after reload.
+**Updating v5: replace `index.html` and `app.js` together.** The stylesheet has not
+changed. The header should show **PhotoCraft · háttéreltávolítás v6** after reload.
 The existing site's authentication/access protection should remain in place.
+
+### v6 startup fix for shared hosting
+
+The affected host returned the v5 `.mjs` files with HTTP 200 **but no Content-Type**.
+The browser therefore rejected the module graph before any image-selection handler
+could be registered. The selected filename was visible while the status stayed
+“Válassz egy képet.” and all action buttons remained disabled.
+
+The distributed `app.js` is now one self-contained **classic script**. It has no
+local module imports and does not need `.mjs` MIME configuration or an `.htaccess`
+change. The three `.mjs` algorithm files and `app-source.mjs` are development sources;
+they do not need to be uploaded. `sam2.js` is also not used by this version.
+Only the external Transformers.js library is loaded dynamically when AI processing
+starts, after the local UI is already working.
+
+File selection is disabled until startup finishes. If `app.js` is missing, fails
+to initialize or stalls, an on-page message identifies the file to upload instead
+of leaving a seemingly functional, inert file picker. The HTML requests `app.js?v=6`
+and `style.css?v=6` to invalidate v5 browser caches.
+
+After changing the source modules, rebuild the checked-in distribution file:
+
+```sh
+node tools/ai-background-test/build.mjs
+node tools/ai-background-test/build.mjs --check
+```
+
+The build has no npm dependencies. Edit `app-source.mjs` for UI/controller changes;
+`app.js` is generated. Source modules remain directly testable in Node.
 
 Use a WebGPU-capable Chrome, Edge or Opera with hardware acceleration enabled.
 First run downloads approximately 320 MB. Model revisions and Transformers.js
@@ -97,6 +121,7 @@ Run the deterministic, dependency-free regressions:
 
 ```sh
 node --test tools/ai-background-test/tests/matting.test.mjs
+node tools/ai-background-test/build.mjs --check
 ```
 
 They cover weak-background foreground locks, hair gaps, soft strands, isolated

@@ -59,19 +59,19 @@ const root = path.resolve(__dirname, '..');
   };
   const hf = new vm.SyntheticModule(Object.keys(mock), function () { for (const [key, value] of Object.entries(mock)) this.setExport(key, value); }, { context });
   await hf.link(() => {}); await hf.evaluate();
-  const modules = new Map();
-  async function moduleAt(filename) {
-    filename = filename.split('?')[0];
-    if (modules.has(filename)) return modules.get(filename);
-    const mod = new vm.SourceTextModule(await fs.readFile(filename, 'utf8'), {
-      context, identifier: filename,
-      importModuleDynamically: async (specifier) => { assert.equal(specifier, 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1'); return hf; },
-    });
-    modules.set(filename, mod);
-    await mod.link((specifier, referring) => moduleAt(path.resolve(path.dirname(referring.identifier), specifier)));
-    return mod;
-  }
-  const app = await moduleAt(path.join(root, 'app.js')); await app.evaluate();
+  // Execute the actual deployable classic script, with NO local module loader.
+  // This reproduces hosts where .mjs has no JavaScript Content-Type.
+  assert.equal(document.getElementById('file').disabled, true);
+  const app = new vm.Script(await fs.readFile(path.join(root, 'app.js'), 'utf8'), {
+    filename: 'app.js',
+    importModuleDynamically: async (specifier) => {
+      assert.equal(specifier, 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1');
+      return hf;
+    },
+  });
+  app.runInContext(context);
+  assert.equal(document.documentElement.dataset.appReady, '6');
+  assert.equal(document.getElementById('file').disabled, false);
   const el = (id) => document.getElementById(id);
   const change = (id) => el(id).dispatchEvent(new dom.window.Event('change'));
   const wait = async (condition) => { for (let i = 0; i < 500; i++) { if (condition()) return; await new Promise((r) => setTimeout(r, 5)); } throw Error(`Timed out: ${el('status').textContent}`); };
@@ -103,5 +103,5 @@ const root = path.resolve(__dirname, '..');
   await load(3000, 300); el('run').click(); await wait(() => !el('download').disabled);
   assert.deepEqual(state.segmentSize, [2048, 205], 'analysis must use returned resized image');
   assert.equal(el('final').width, 3000); assert.equal(el('final').height, 300);
-  console.log('PASS: DOM import, GPU guard, processing locks, tensor disposal, transparent PNG export, brush/undo, cached rerun, cancellation, analysis resize and original-size output.');
+  console.log('PASS: single-file classic-script startup without local modules, GPU guard, processing locks, tensor disposal, transparent PNG export, brush/undo, cached rerun, cancellation, analysis resize and original-size output.');
 })().catch((err) => { console.error(err); process.exitCode = 1; });
