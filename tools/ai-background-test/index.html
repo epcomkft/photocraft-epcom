@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>EPCOM AI Background Test – BEN2 + ViTMatte</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1>AI háttéreltávolítás teszt</h1>
+      <p>BEN2 → automatikus trimap → ViTMatte. A feldolgozás a böngészőben történik.</p>
+    </header>
+
+    <section class="panel">
+      <label class="file">
+        <span>Kép kiválasztása</span>
+        <input id="file" type="file" accept="image/*" />
+      </label>
+
+      <div class="settings">
+        <label>Biztos háttér
+          <input id="bgThreshold" type="number" min="0" max="0.49" step="0.01" value="0.03" />
+        </label>
+        <label>Biztos előtér
+          <input id="fgThreshold" type="number" min="0.51" max="1" step="0.01" value="0.97" />
+        </label>
+        <label>Ismeretlen perem szélesítése (px)
+          <input id="edgeRadius" type="number" min="0" max="64" step="1" value="10" />
+        </label>
+        <label>Teszt max. hosszú oldal (px)
+          <input id="maxSide" type="number" min="512" max="4096" step="128" value="2048" />
+        </label>
+      </div>
+
+      <div class="actions">
+        <button id="run" disabled>BEN2 + ViTMatte futtatása</button>
+        <button id="download" disabled>Átlátszó PNG letöltése</button>
+      </div>
+
+      <div id="status" class="status">Válassz egy képet.</div>
+      <progress id="progress" max="1" value="0"></progress>
+      <div id="gpu" class="gpu"></div>
+    </section>
+
+    <section class="results">
+      <article>
+        <h2>Eredeti</h2>
+        <canvas id="original"></canvas>
+      </article>
+      <article>
+        <h2>BEN2</h2>
+        <canvas id="ben2"></canvas>
+      </article>
+      <article>
+        <h2>BEN2 + ViTMatte</h2>
+        <canvas id="final"></canvas>
+      </article>
+      <article>
+        <h2>Trimap</h2>
+        <canvas id="trimap"></canvas>
+      </article>
+    </section>
+
+    <section class="notes">
+      <strong>Megjegyzés:</strong> ez a tesztoldal egyelőre a teljes képen futtatja a ViTMatte-ot,
+      ezért a nagyon nagy fotókat a beállított tesztméretre csökkenti. A PhotoCraft-integrációban
+      a végleges változat tile-os, eredeti felbontású haj/szőr finomítást fog használni.
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
