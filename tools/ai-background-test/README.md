@@ -1,51 +1,116 @@
-# EPCOM AI background removal test
+# PhotoCraft background removal — v5
 
-Browser-only proof of concept for a high-detail background removal pipeline:
+Browser-only background-removal test module. It stays separate from PhotoCraft's
+native Rust application. Images are processed locally; model files are downloaded,
+not the user's images uploaded. No API key or Python server is needed to use it.
 
-**BEN2 → SAM2 semantic support → safe trimap → ViTMatte HQ → transparent PNG**
+**BEN2 confidence → editable trimap → full-resolution ViTMatte → edge colour estimation → RGBA PNG**
 
-This stays separate from the PhotoCraft UI until hair/fur quality is validated.
+## The quality fix
 
-## What changed in HQ mode
+The previous trimap treated BEN2 values as low as **20/255** as certain foreground
+(after a small erosion), and could also promote weak BEN2 pixels through an
+unprompted SAM2 mask. These pixels were forced to alpha 255 after matting. This
+locked grey background bands around hair into the exported image.
 
-- The original image is kept at its full resolution.
-- `maxSide` only limits the BEN2/SAM2 semantic analysis image.
-- BEN2 is the primary subject mask.
-- SAM2 is advisory only: it may widen the candidate subject area, but it can no longer erase foreground that BEN2 already recognized.
-- The trimap keeps the object interior as certain foreground and sends a wide edge band to ViTMatte.
-- ViTMatte runs on the original-resolution pixels in overlapping 512 px tiles with 128 px overlap.
-- The wider unknown band is intentional for human hair, dog fur, whiskers, ear fur and other thin/partially transparent details.
-- The exported PNG keeps the original image dimensions.
+- Certain foreground now requires **250/255** confidence, followed by erosion.
+  Uncertain edges remain unknown. There is no closing operation that fills hair gaps.
+- The candidate region grows from a 128/255 subject estimate, not every weak
+  background response. Small isolated components are optional noise candidates;
+  all substantial subjects are preserved. Nearby small strands remain inside the
+  unknown band. The speck filter can be turned off for small separate objects.
+- Automatic one-point SAM2 union is no longer part of this pipeline. `sam2.js`
+  remains as a legacy experimental module; v5 neither imports nor downloads it.
+- ViTMatte operates on original pixels in **512 × 512** tiles with **128 px overlap**.
+  Predictions are blended as floats, then quantized once. Known trimap pixels stay
+  exact; missing, malformed or non-finite outputs are errors, never silent fallback.
+- Partially transparent edge RGB is corrected using nearby foreground/background
+  colours and regularized colour unmixing. Opaque colours are unchanged. This
+  reduces grey/white contamination when compositing on dark engraving backgrounds.
+  Set the correction to 0 to preserve all original edge colours. For an already
+  transparent source, colour unmixing is skipped and original alpha is multiplied
+  by the new matte, never overwritten.
+- The analysis resize now uses the returned image. The source and PNG dimensions
+  stay unchanged. The first pixel of bilinear mask resizing no longer mixes with
+  the wrong neighbouring pixel.
+- BEN2 is released before loading ViTMatte; tensors are disposed after every tile.
+  Refinements on the same image reuse the BEN2 mask. File changes and settings are
+  locked while processing. Cancellation stops after the current model call.
+- Sources are limited to 40 MB, 16 megapixels and 8192 pixels on either side, with
+  visible errors rather than silent downsampling. Inputs: PNG, JPEG, WebP.
 
-This specifically fixes the failure mode where a single SAM2 point selected only hair/fur and the old hard SAM2 gate removed the face/body.
+## Install / update
 
-## Run
+Serve over HTTPS, for example at `/admin/photocraft-ai-test/`. Replace/upload **all
+six runtime files together**:
 
-Serve this folder over HTTPS and open `index.html` in a recent Chrome or Edge browser with WebGPU.
+```
+index.html
+app.js
+style.css
+matting-core.mjs
+matting-engine.mjs
+edge-colors.mjs
+```
 
-For the EPCOM host a convenient test location is:
+`sam2.js` is no longer required by v5.
+The server must serve `.mjs` as JavaScript (`text/javascript` or
+`application/javascript`). All local module and stylesheet references use `v=5`
+cache keys. The header should show **PhotoCraft · háttéreltávolítás v5** after reload.
+The existing site's authentication/access protection should remain in place.
 
-`/admin/photocraft-ai-test/`
+Use a WebGPU-capable Chrome, Edge or Opera with hardware acceleration enabled.
+First run downloads approximately 320 MB. Model revisions and Transformers.js
+3.8.1 are pinned for reproducibility:
 
-Copy these files there:
+| Model | Revision |
+| --- | --- |
+| `onnx-community/BEN2-ONNX` (fp16) | `c552aa82688edce09f0ac9d2e31ad53d9d629010` |
+| `Xenova/vitmatte-small-composition-1k` (fp32) | `6bc1297f6140f055a227b6d2cfe8c093281f35d2` |
 
-- `index.html`
-- `app.js`
-- `sam2.js`
-- `style.css`
+## Use and corrections
 
-The first run downloads the models from Hugging Face. Later builds can self-host pinned model files.
+1. Choose an image and run background removal.
+2. Inspect at 100% on black and white backgrounds, or view the alpha mask.
+   Preview backgrounds never affect the transparent PNG export.
+3. If needed, paint **background** (red), **keep** (green), or **unknown fine edge**
+   (blue) on the original. Green locks opaque foreground, so use blue around hair,
+   fur and whiskers. Marks apply only where explicitly painted.
+4. Rerun refinement; the subject model does not need to rerun. Undo and erasing
+   marks are available. Changed settings/marks disable stale PNG exports until
+   refinement succeeds.
+5. Download `<original-name>-hatter-nelkul.png` at the original resolution.
 
-## Models
+Defaults: inner band 12 px, outer band 32 px, colour correction 80%. Band radii
+scale with the image's longest side relative to 2048 px. Increase the outer band
+for long whiskers or flyaway hair; widening it also admits more background and
+increases processing time. The blue brush can designate a missed region directly.
 
-- `onnx-community/BEN2-ONNX` — primary foreground/background estimate.
-- SAM2 Hiera Tiny ONNX — semantic main-subject support.
-- `Xenova/vitmatte-small-composition-1k` — high-resolution alpha matting from image + trimap.
+This is image matting, not generative reconstruction. No model can guarantee every
+hair on every low-contrast, blurred or compressed image. Difficult foreground
+selection can still require correction marks. Do not infer quality from a SAM2
+predicted-IoU score; it is no longer displayed as an output-quality indicator.
 
-## Recommended defaults
+## Verification
 
-- BEN2/SAM2 analysis max side: **2048 px**
-- sure-foreground inner shrink: **6 px**
-- hair/fur search band: **64 px**
+Run the deterministic, dependency-free regressions:
 
-For very difficult long hair or fluffy dog fur, increasing the search band to 80–96 px can help, at the cost of more ViTMatte tiles and longer processing time.
+```sh
+node --test tools/ai-background-test/tests/matting.test.mjs
+```
+
+They cover weak-background foreground locks, hair gaps, soft strands, isolated
+specks and multiple subjects, manual trimap overrides, alpha preservation, resize
+edges, tiled overlap continuity, small images, cancellation, malformed model
+outputs and foreground colour unmixing.
+
+Actual pinned BEN2 and ViTMatte ONNX inference was also exercised on the supplied
+1365 × 2048 portrait using ONNX Runtime CPU. The exact JavaScript trimap, tile
+blending and edge-colour modules in this folder produced the corrected output.
+The hair edge was inspected on black and white backgrounds at original resolution;
+the isolated right-side speck was removed and sampled opaque face pixels remained
+opaque. No ground-truth alpha was available; this is a visual regression check,
+not a numeric quality benchmark or a validation across dog/cat breeds.
+
+Browser/GPU validation status is recorded in `tests/VALIDATION.md`. Private user
+photos and their derived outputs are deliberately not included in the repository.
