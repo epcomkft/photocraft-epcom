@@ -21,7 +21,7 @@ let matteProcessor = null;
 let matteModel = null;
 
 const VITMATTE_TILE = 512;
-const VITMATTE_OVERLAP = 96;
+const VITMATTE_OVERLAP = 128;
 
 gpuEl.textContent = navigator.gpu
   ? "WebGPU: elérhető – GPU gyorsítás használható. ViTMatte 512 px-es csempékkel fut a GPU-memória védelmében."
@@ -33,7 +33,8 @@ fileInput.addEventListener("change", async () => {
   try {
     setStatus("Kép betöltése…", 0);
     sourceImage = await RawImage.fromBlob(file);
-    sourceImage = await limitImage(sourceImage, readNumber("maxSide", 2048));
+    // Az eredetit teljes felbontásban megtartjuk. A maxSide csak a BEN2/SAM2
+    // szemantikai elemzésre vonatkozik; a ViTMatte az eredeti pixeleken dolgozik.
     drawRaw(sourceImage, $("original"));
     clearCanvas($("ben2"));
     clearCanvas($("sam2"));
@@ -65,30 +66,54 @@ runButton.addEventListener("click", async () => {
   try {
     await ensureModels();
 
+    const analysisMaxSide = Math.max(768, Math.round(readNumber("maxSide", 2048)));
+    setStatus("Részletes mód: eredeti felbontás megtartása, AI elemzőkép készítése…", 0.54);
+    const analysisImage = await limitImage(sourceImage, analysisMaxSide);
+
     setStatus("BEN2: alany felismerése és soft alpha maszk készítése…", 0.55);
-    const benResult = await ben2Pipe(sourceImage);
+    const benResult = await ben2Pipe(analysisImage);
     const benImage = Array.isArray(benResult) ? benResult[0] : benResult;
     drawRaw(benImage, $("ben2"));
 
-    const alpha = alphaFromBen2(benImage);
+    let alphaLow = alphaFromBen2(benImage);
+    if (alphaLow.width !== analysisImage.width || alphaLow.height !== analysisImage.height) {
+      alphaLow = resizeSingleChannel(alphaLow, analysisImage.width, analysisImage.height, true);
+    }
 
-    const seed = pickSubjectSeed(alpha);
+    const seed = pickSubjectSeed(alphaLow);
     setStatus(`SAM2: fő alany kiválasztása (${Math.round(seed.x)}, ${Math.round(seed.y)})…`, 0.57);
-    const sam = await sam2Subject(sourceImage, seed, (message, p) => setStatus(message, p));
+    const sam = await sam2Subject(analysisImage, seed, (message, p) => setStatus(message, p));
     const samRaw = new RawImage(sam.data, sam.width, sam.height, 1);
     drawRaw(samRaw, $("sam2"));
 
-    const inner = Math.max(0, Math.round(readNumber("samInner", 8)));
-    const outer = Math.max(inner + 1, Math.round(readNumber("samOuter", 36)));
+    const innerLow = Math.max(0, Math.round(readNumber("samInner", 6)));
+    const outerLow = Math.max(innerLow + 1, Math.round(readNumber("samOuter", 64)));
 
-    setStatus("Trimap készítése: SAM2 szemantika + BEN2 finom részletek…", 0.69);
-    const trimap = makeSamTrimap(alpha, samRaw, inner, outer);
+    const scaleX = sourceImage.width / analysisImage.width;
+    const scaleY = sourceImage.height / analysisImage.height;
+    const radiusScale = Math.max(scaleX, scaleY);
+
+    let alpha = alphaLow;
+    let samForTrimap = samRaw;
+    let inner = innerLow;
+    let outer = outerLow;
+
+    if (analysisImage.width !== sourceImage.width || analysisImage.height !== sourceImage.height) {
+      setStatus("Maszkok visszaskálázása az eredeti felbontásra…", 0.68);
+      alpha = resizeSingleChannel(alphaLow, sourceImage.width, sourceImage.height, true);
+      samForTrimap = resizeSingleChannel(samRaw, sourceImage.width, sourceImage.height, false);
+      inner = Math.max(1, Math.round(innerLow * radiusScale));
+      outer = Math.max(inner + 1, Math.round(outerLow * radiusScale));
+    }
+
+    setStatus("Trimap készítése: BEN2 az elsődleges, SAM2 csak szemantikai támasz…", 0.69);
+    const trimap = makeRobustTrimap(alpha, samForTrimap, inner, outer);
     drawRaw(trimap, $("trimap"));
 
-    setStatus("ViTMatte: haj/szőr perem finomítása 512 px-es csempékkel…", 0.72);
+    setStatus("ViTMatte: haj/szőr perem finomítása EREDETI felbontáson…", 0.72);
     const matte = await runViTMatteTiled(sourceImage, trimap, alpha, (done, total) => {
       const f = total > 0 ? done / total : 1;
-      setStatus(`ViTMatte: haj/szőr finomítása – ${done}/${total} csempe`, 0.72 + 0.26 * f);
+      setStatus(`ViTMatte HQ: haj/szőr finomítása – ${done}/${total} csempe`, 0.72 + 0.26 * f);
     });
     const cutout = sourceImage.clone().rgba();
     cutout.putAlpha(matte);
@@ -170,6 +195,47 @@ function alphaFromBen2(img) {
   throw new Error(`BEN2 váratlan kimenet: ${img.channels} csatorna.`);
 }
 
+function resizeSingleChannel(raw, targetW, targetH, smooth = true) {
+  if (raw.channels !== 1) throw new Error("A maszk átméretezése csak 1 csatornás képre használható.");
+  if (raw.width === targetW && raw.height === targetH) return raw.clone();
+
+  const out = new Uint8ClampedArray(targetW * targetH);
+  const sxScale = raw.width / targetW;
+  const syScale = raw.height / targetH;
+
+  for (let y = 0; y < targetH; y++) {
+    const sy = (y + 0.5) * syScale - 0.5;
+    const y0 = clamp(Math.floor(sy), 0, raw.height - 1);
+    const y1 = Math.min(y0 + 1, raw.height - 1);
+    const fy = clamp(sy - Math.floor(sy), 0, 1);
+
+    for (let x = 0; x < targetW; x++) {
+      const sx = (x + 0.5) * sxScale - 0.5;
+
+      if (!smooth) {
+        const nx = clamp(Math.round(sx), 0, raw.width - 1);
+        const ny = clamp(Math.round(sy), 0, raw.height - 1);
+        out[y * targetW + x] = raw.data[ny * raw.width + nx];
+        continue;
+      }
+
+      const x0 = clamp(Math.floor(sx), 0, raw.width - 1);
+      const x1 = Math.min(x0 + 1, raw.width - 1);
+      const fx = clamp(sx - Math.floor(sx), 0, 1);
+
+      const v00 = raw.data[y0 * raw.width + x0];
+      const v10 = raw.data[y0 * raw.width + x1];
+      const v01 = raw.data[y1 * raw.width + x0];
+      const v11 = raw.data[y1 * raw.width + x1];
+      const top = v00 * (1 - fx) + v10 * fx;
+      const bottom = v01 * (1 - fx) + v11 * fx;
+      out[y * targetW + x] = Math.round(top * (1 - fy) + bottom * fy);
+    }
+  }
+
+  return new RawImage(out, targetW, targetH, 1);
+}
+
 function pickSubjectSeed(alpha) {
   const w = alpha.width;
   const h = alpha.height;
@@ -231,7 +297,7 @@ function pickSubjectSeed(alpha) {
   return best ?? { x: cx, y: cy };
 }
 
-function makeSamTrimap(alpha, samMask, innerRadius, outerRadius) {
+function makeRobustTrimap(alpha, samMask, innerRadius, outerRadius) {
   const w = alpha.width;
   const h = alpha.height;
   const n = w * h;
@@ -239,24 +305,61 @@ function makeSamTrimap(alpha, samMask, innerRadius, outerRadius) {
     throw new Error("SAM2 és BEN2 maszk mérete nem egyezik.");
   }
 
+  // A korábbi verzióban a SAM2 kemény kapu volt. Egyetlen pontból a SAM2
+  // időnként csak a hajat/szőrt választotta ki, ezért az arc/test kieshetett.
+  // Itt a BEN2 az elsődleges alanymaszk; a SAM2 csak kibővítheti a keresési
+  // területet, de többé nem törölhet BEN2 által felismert biztos előteret.
+  const benLoose = new Uint8Array(n);
   const sam = new Uint8Array(n);
-  for (let i = 0; i < n; i++) sam[i] = samMask.data[i] >= 128 ? 1 : 0;
-
-  const sure = innerRadius > 0 ? erodeBinary(sam, w, h, innerRadius) : sam;
-  const allowed = outerRadius > 0 ? dilateBinary(sam, w, h, outerRadius) : sam;
-  const out = new Uint8ClampedArray(n);
 
   for (let i = 0; i < n; i++) {
+    benLoose[i] = alpha.data[i] >= 20 ? 1 : 0;
+    sam[i] = samMask.data[i] >= 128 ? 1 : 0;
+  }
+
+  // Apró tűlyukak/repedések zárása a BEN2 maszk belsejében.
+  // Kicsi sugarat használunk, hogy a karok/lábak közötti valódi háttér ne
+  // tömődjön be, a haj/szőr vékony részletei pedig ne váljanak tömbbé.
+  const closeRadius = Math.max(1, Math.min(8, Math.round(Math.max(1, innerRadius) * 0.4)));
+  const benClosed = erodeBinary(
+    dilateBinary(benLoose, w, h, closeRadius),
+    w,
+    h,
+    closeRadius,
+  );
+
+  // A keresési tartomány a BEN2 és a SAM2 uniója körül van. Ez ad elég
+  // szabadságot a ViTMatte-nak ahhoz, hogy az eredeti nagyfelbontású képből
+  // visszahozza a BEN2/SAM2 által nem látott egyedi haj- és szőrszálakat.
+  const subject = new Uint8Array(n);
+  for (let i = 0; i < n; i++) subject[i] = benClosed[i] || sam[i] ? 1 : 0;
+
+  const sureBen = innerRadius > 0
+    ? erodeBinary(benClosed, w, h, innerRadius)
+    : benClosed;
+  const samInnerRadius = Math.max(innerRadius, Math.round(innerRadius * 1.5));
+  const sureSam = samInnerRadius > 0
+    ? erodeBinary(sam, w, h, samInnerRadius)
+    : sam;
+  const allowed = outerRadius > 0
+    ? dilateBinary(subject, w, h, outerRadius)
+    : subject;
+
+  const out = new Uint8ClampedArray(n);
+  for (let i = 0; i < n; i++) {
     if (!allowed[i]) {
-      // A SAM2 szerint ez nem a fő objektum: ne engedjük, hogy BEN2 háttérdarabokat
-      // (szék, kanapé, növény stb.) végleges előtérnek zároljon.
       out[i] = 0;
-    } else if (sure[i] && alpha.data[i] >= 32) {
-      // A fő objektum belseje: biztos előtér.
+    } else if (sureBen[i]) {
+      // BEN2-belső: biztos előtér. A SAM2 ezt soha nem írhatja felül.
+      out[i] = 255;
+    } else if (sureSam[i] && alpha.data[i] >= 16) {
+      // SAM2 csak akkor zárolhat előteret, ha a BEN2 legalább gyenge
+      // előtérjelet is lát. Így egy rossz SAM2-szegmens nem tesz háttérdarabot
+      // biztos előtérré.
       out[i] = 255;
     } else {
-      // A SAM2 határa körüli széles sávot a ViTMatte döntse el.
-      // Ebbe beleférnek a SAM által elvesztett haj- és szőrszálak is.
+      // Minden perem és bizonytalan rész ViTMatte-terület. Ide esnek a
+      // hajszálak, kutyaszőr, bajusz, fül körüli szőr és áttetsző szélek.
       out[i] = 128;
     }
   }
