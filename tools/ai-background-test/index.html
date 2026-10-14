@@ -10,7 +10,7 @@
   <main class="wrap">
     <header>
       <h1>AI háttéreltávolítás teszt</h1>
-      <p>BEN2 → SAM2 főalany-kiválasztás → automatikus trimap → ViTMatte. A feldolgozás a böngészőben történik.</p>
+      <p>BEN2 → SAM2 szemantikai támasz → biztonságos trimap → ViTMatte HQ. A haj- és szőrperem finomítása az eredeti felbontású képen történik.</p>
     </header>
 
     <section class="panel">
@@ -21,18 +21,18 @@
 
       <div class="settings">
         <label>SAM2 biztos előtér belső zsugorítása (px)
-          <input id="samInner" type="number" min="0" max="32" step="1" value="8" />
+          <input id="samInner" type="number" min="0" max="32" step="1" value="6" />
         </label>
-        <label>Haj/szőr keresési sáv a SAM2 körül (px)
-          <input id="samOuter" type="number" min="8" max="96" step="1" value="36" />
+        <label>Haj/szőr keresési sáv az AI maszk körül (px)
+          <input id="samOuter" type="number" min="8" max="160" step="1" value="64" />
         </label>
-        <label>Teszt max. hosszú oldal (px)
-          <input id="maxSide" type="number" min="512" max="4096" step="128" value="2048" />
+        <label>BEN2/SAM2 elemzőkép max. hosszú oldal (px)
+          <input id="maxSide" type="number" min="768" max="4096" step="128" value="2048" />
         </label>
       </div>
 
       <div class="actions">
-        <button id="run" disabled>BEN2 + SAM2 + ViTMatte futtatása</button>
+        <button id="run" disabled>Részletes háttéreltávolítás futtatása</button>
         <button id="download" disabled>Átlátszó PNG letöltése</button>
       </div>
 
@@ -59,19 +59,20 @@
         <canvas id="trimap"></canvas>
       </article>
       <article>
-        <h2>BEN2 + SAM2 + ViTMatte</h2>
+        <h2>HQ eredmény – eredeti felbontás</h2>
         <canvas id="final"></canvas>
       </article>
     </section>
 
     <section class="notes">
-      <strong>Megjegyzés:</strong> a SAM2 feladata kizárni a tévesen előtérnek vett háttérelemeket
-      (például széket, kanapét vagy növényt). A ViTMatte csak a SAM2 körüli bizonytalan haj/szőr
-      sávot finomítja 512 px-es átfedő csempékben. A tesztkép jelenleg legfeljebb a megadott
-      hosszú oldalra csökken; ha ez stabilan jó, a következő lépés az eredeti felbontású feldolgozás.
+      <strong>Megjegyzés:</strong> a BEN2 az elsődleges alanymaszk, ezért a SAM2 többé nem tudja
+      véletlenül levágni az arcot, testet vagy a kutya törzsét. A SAM2 csak szemantikai támasz és
+      keresési terület-bővítés. A ViTMatte a bizonytalan haj/szőr sávot 512 px-es, 128 px átfedésű
+      csempékben, az eredeti kép teljes felbontásán finomítja. A fenti max. hosszú oldal csak a
+      BEN2/SAM2 elemzőképre vonatkozik, a letöltött PNG az eredeti képméretet tartja meg.
     </section>
   </main>
 
-  <script type="module" src="./app.js?v=3"></script>
+  <script type="module" src="./app.js?v=4"></script>
 </body>
 </html>
