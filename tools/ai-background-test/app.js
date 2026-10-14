@@ -19,8 +19,11 @@ let ben2Pipe = null;
 let matteProcessor = null;
 let matteModel = null;
 
+const VITMATTE_TILE = 512;
+const VITMATTE_OVERLAP = 96;
+
 gpuEl.textContent = navigator.gpu
-  ? "WebGPU: elérhető – GPU gyorsítás használható."
+  ? "WebGPU: elérhető – GPU gyorsítás használható. ViTMatte 512 px-es csempékkel fut a GPU-memória védelmében."
   : "WebGPU: nem elérhető. Ehhez a teszthez Chrome/Edge + WebGPU szükséges.";
 
 fileInput.addEventListener("change", async () => {
@@ -74,18 +77,18 @@ runButton.addEventListener("click", async () => {
     const trimap = makeTrimap(alpha, bgThreshold, fgThreshold, radius);
     drawRaw(trimap, $("trimap"));
 
-    setStatus("ViTMatte: haj/szőr és félig áttetsző perem finomítása…", 0.75);
-    const inputs = await matteProcessor(sourceImage, trimap);
-    const { alphas } = await matteModel(inputs);
-
-    const matte = alphaTensorToRaw(alphas, sourceImage.width, sourceImage.height);
+    setStatus("ViTMatte: haj/szőr perem finomítása 512 px-es csempékkel…", 0.72);
+    const matte = await runViTMatteTiled(sourceImage, trimap, alpha, (done, total) => {
+      const f = total > 0 ? done / total : 1;
+      setStatus(`ViTMatte: haj/szőr finomítása – ${done}/${total} csempe`, 0.72 + 0.26 * f);
+    });
     const cutout = sourceImage.clone().rgba();
     cutout.putAlpha(matte);
     finalImage = cutout;
 
     drawRaw(finalImage, $("final"));
     downloadButton.disabled = false;
-    setStatus("Kész. A jobb alsó kép a BEN2 + ViTMatte eredmény.", 1);
+    setStatus("Kész. A jobb alsó kép a BEN2 + tiled ViTMatte eredmény.", 1);
   } catch (err) {
     fail(err);
   } finally {
@@ -201,6 +204,142 @@ function makeTrimap(alpha, bgThreshold, fgThreshold, radius) {
     out[i] = expanded[i] ? 128 : hard[i];
   }
   return new RawImage(out, w, h, 1);
+}
+
+
+async function runViTMatteTiled(image, trimap, benAlpha, progress) {
+  const w = image.width;
+  const h = image.height;
+  if (trimap.width !== w || trimap.height !== h || benAlpha.width !== w || benAlpha.height !== h) {
+    throw new Error("A BEN2 maszk, trimap és eredeti kép mérete nem egyezik.");
+  }
+
+  const stride = VITMATTE_TILE - VITMATTE_OVERLAP;
+  const xs = tileStarts(w, VITMATTE_TILE, stride);
+  const ys = tileStarts(h, VITMATTE_TILE, stride);
+  const tiles = [];
+
+  for (const y of ys) {
+    for (const x of xs) {
+      if (tileHasUnknown(trimap, x, y, VITMATTE_TILE)) {
+        tiles.push([x, y]);
+      }
+    }
+  }
+
+  const accum = new Float32Array(w * h);
+  const weights = new Float32Array(w * h);
+  const finalAlpha = new Uint8ClampedArray(w * h);
+
+  // A biztos területek 0/255 maradnak. A bizonytalan terület addig BEN2 fallback.
+  for (let i = 0; i < finalAlpha.length; i++) {
+    const t = trimap.data[i];
+    finalAlpha[i] = t === 0 ? 0 : t === 255 ? 255 : benAlpha.data[i];
+  }
+
+  if (tiles.length === 0) {
+    progress?.(0, 0);
+    return new RawImage(finalAlpha, w, h, 1);
+  }
+
+  let done = 0;
+  for (const [startX, startY] of tiles) {
+    const imageTile = cropPadRaw(image, startX, startY, VITMATTE_TILE);
+    const trimapTile = cropPadRaw(trimap, startX, startY, VITMATTE_TILE);
+    const inputs = await matteProcessor(imageTile, trimapTile);
+    const { alphas } = await matteModel(inputs);
+    const matteTile = alphaTensorToRaw(alphas, VITMATTE_TILE, VITMATTE_TILE);
+
+    const actualW = Math.min(VITMATTE_TILE, w - startX);
+    const actualH = Math.min(VITMATTE_TILE, h - startY);
+
+    for (let ty = 0; ty < actualH; ty++) {
+      const gy = startY + ty;
+      for (let tx = 0; tx < actualW; tx++) {
+        const gx = startX + tx;
+        const gi = gy * w + gx;
+        if (trimap.data[gi] !== 128) continue;
+
+        const wx = overlapWeight(tx, startX, w, VITMATTE_TILE, VITMATTE_OVERLAP);
+        const wy = overlapWeight(ty, startY, h, VITMATTE_TILE, VITMATTE_OVERLAP);
+        const weight = Math.max(0.001, wx * wy);
+        const alpha01 = matteTile.data[ty * VITMATTE_TILE + tx] / 255;
+        accum[gi] += alpha01 * weight;
+        weights[gi] += weight;
+      }
+    }
+
+    done++;
+    progress?.(done, tiles.length);
+    await yieldToBrowser();
+  }
+
+  for (let i = 0; i < finalAlpha.length; i++) {
+    if (trimap.data[i] === 128 && weights[i] > 0) {
+      finalAlpha[i] = Math.round(clamp(accum[i] / weights[i], 0, 1) * 255);
+    }
+  }
+
+  return new RawImage(finalAlpha, w, h, 1);
+}
+
+function tileStarts(length, tile, stride) {
+  if (length <= tile) return [0];
+  const starts = [];
+  for (let s = 0; s < length - tile; s += stride) starts.push(s);
+  const last = length - tile;
+  if (starts[starts.length - 1] !== last) starts.push(last);
+  return starts;
+}
+
+function tileHasUnknown(trimap, startX, startY, tile) {
+  const maxX = Math.min(trimap.width, startX + tile);
+  const maxY = Math.min(trimap.height, startY + tile);
+  for (let y = startY; y < maxY; y++) {
+    const row = y * trimap.width;
+    for (let x = startX; x < maxX; x++) {
+      if (trimap.data[row + x] === 128) return true;
+    }
+  }
+  return false;
+}
+
+function cropPadRaw(raw, startX, startY, size) {
+  const channels = raw.channels;
+  const out = new Uint8ClampedArray(size * size * channels);
+  const src = raw.data;
+
+  for (let y = 0; y < size; y++) {
+    const sy = clamp(startY + y, 0, raw.height - 1);
+    for (let x = 0; x < size; x++) {
+      const sx = clamp(startX + x, 0, raw.width - 1);
+      const si = (sy * raw.width + sx) * channels;
+      const di = (y * size + x) * channels;
+      for (let c = 0; c < channels; c++) out[di + c] = src[si + c];
+    }
+  }
+
+  return new RawImage(out, size, size, channels);
+}
+
+function overlapWeight(pos, globalStart, fullLength, tile, overlap) {
+  let weight = 1;
+  if (globalStart > 0 && pos < overlap) {
+    weight *= smooth01((pos + 1) / (overlap + 1));
+  }
+  if (globalStart + tile < fullLength && pos >= tile - overlap) {
+    weight *= smooth01((tile - pos) / (overlap + 1));
+  }
+  return weight;
+}
+
+function smooth01(t) {
+  t = clamp(t, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function yieldToBrowser() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function dilateBinary(src, w, h, radius) {
