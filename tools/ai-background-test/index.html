@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>EPCOM AI Background Test – BEN2 + ViTMatte</title>
+  <title>EPCOM AI Background Test – BEN2 + SAM2 + ViTMatte</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
   <main class="wrap">
     <header>
       <h1>AI háttéreltávolítás teszt</h1>
-      <p>BEN2 → automatikus trimap → ViTMatte. A feldolgozás a böngészőben történik.</p>
+      <p>BEN2 → SAM2 főalany-kiválasztás → automatikus trimap → ViTMatte. A feldolgozás a böngészőben történik.</p>
     </header>
 
     <section class="panel">
@@ -20,14 +20,11 @@
       </label>
 
       <div class="settings">
-        <label>Biztos háttér
-          <input id="bgThreshold" type="number" min="0" max="0.49" step="0.01" value="0.03" />
+        <label>SAM2 biztos előtér belső zsugorítása (px)
+          <input id="samInner" type="number" min="0" max="32" step="1" value="8" />
         </label>
-        <label>Biztos előtér
-          <input id="fgThreshold" type="number" min="0.51" max="1" step="0.01" value="0.97" />
-        </label>
-        <label>Ismeretlen perem szélesítése (px)
-          <input id="edgeRadius" type="number" min="0" max="64" step="1" value="10" />
+        <label>Haj/szőr keresési sáv a SAM2 körül (px)
+          <input id="samOuter" type="number" min="8" max="96" step="1" value="36" />
         </label>
         <label>Teszt max. hosszú oldal (px)
           <input id="maxSide" type="number" min="512" max="4096" step="128" value="2048" />
@@ -35,7 +32,7 @@
       </div>
 
       <div class="actions">
-        <button id="run" disabled>BEN2 + ViTMatte futtatása</button>
+        <button id="run" disabled>BEN2 + SAM2 + ViTMatte futtatása</button>
         <button id="download" disabled>Átlátszó PNG letöltése</button>
       </div>
 
@@ -54,19 +51,24 @@
         <canvas id="ben2"></canvas>
       </article>
       <article>
-        <h2>BEN2 + ViTMatte</h2>
-        <canvas id="final"></canvas>
+        <h2>SAM2 fő alany</h2>
+        <canvas id="sam2"></canvas>
       </article>
       <article>
         <h2>Trimap</h2>
         <canvas id="trimap"></canvas>
       </article>
+      <article>
+        <h2>BEN2 + SAM2 + ViTMatte</h2>
+        <canvas id="final"></canvas>
+      </article>
     </section>
 
     <section class="notes">
-      <strong>Megjegyzés:</strong> ez a tesztoldal egyelőre a teljes képen futtatja a ViTMatte-ot,
-      ezért a nagyon nagy fotókat a beállított tesztméretre csökkenti. A PhotoCraft-integrációban
-      a végleges változat tile-os, eredeti felbontású haj/szőr finomítást fog használni.
+      <strong>Megjegyzés:</strong> a SAM2 feladata kizárni a tévesen előtérnek vett háttérelemeket
+      (például széket, kanapét vagy növényt). A ViTMatte csak a SAM2 körüli bizonytalan haj/szőr
+      sávot finomítja 512 px-es átfedő csempékben. A tesztkép jelenleg legfeljebb a megadott
+      hosszú oldalra csökken; ha ez stabilan jó, a következő lépés az eredeti felbontású feldolgozás.
     </section>
   </main>
 
