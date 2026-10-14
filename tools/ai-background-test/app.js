@@ -111,7 +111,7 @@ async function findSubject(signal) {
     // resize RETURNS a new image; the original must remain untouched.
     let analysis = new RawImage(source.data.slice(), source.width, source.height, 4);
     const scale = Math.min(1, 2048 / Math.max(source.width, source.height));
-    if (scale < 1) analysis = await analysis.resize(Math.round(source.width * scale), Math.round(source.height * scale));
+    if (scale < 1) analysis = await analysis.resize(Math.max(1, Math.round(source.width * scale)), Math.max(1, Math.round(source.height * scale)));
     status('Az alany felismerése…', .25);
     const output = await segmenter(analysis);
     checkAbort(signal);
