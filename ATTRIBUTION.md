@@ -116,3 +116,13 @@ next to the files:
 | `corpus/pixls/` (7 files, 226 MB) | Real camera raws, one per decode path: Canon PowerShot SX50 HS (CR2 and its DNG conversion), Nikon D3 uncompressed NEF, Sony DSC-RX0 cRAW ARW, Panasonic DC-G9 high-res RW2, Olympus E-1 GRBG ORF, plus the E-5 packed ORF as the documented known-unsupported case. Per file (each CC0, per its database entry): [IMG_4059.CR2](https://raw.pixls.us/data/Canon/PowerShot%20SX50%20HS/IMG_4059.CR2), [CRW_4061.DNG](https://raw.pixls.us/data/Canon/PowerShot%20SX50%20HS/CRW_4061.DNG), [JD1_8203.NEF](https://raw.pixls.us/data/Nikon/D3/JD1_8203.NEF), [DSC00009.ARW](https://raw.pixls.us/data/Sony/DSC-RX0/DSC00009.ARW), [P1000475.RW2](https://raw.pixls.us/data/Panasonic/DC-G9/P1000475.RW2), [E_1__C106743_gredos.ORF](https://raw.pixls.us/data/Olympus/E-1/E_1__C106743_gredos.ORF), [_7061961_copy.ORF](https://raw.pixls.us/data/Olympus/E-5/_7061961_copy.ORF) | The photographers of the pixls.us raw samples database | [raw.pixls.us](https://raw.pixls.us) `data/`, fetched per [xtask/src/corpus_pins.rs](xtask/src/corpus_pins.rs) | CC0 / public domain, per file as linked |
 
 Files copied into `corpus/` by hand (tiff, exr, raw) must be MIT, BSD or CC0.
+
+
+## Separate BiRefNet HR browser comparison tool
+
+| Path / use | Title | Author | Source | License |
+|---|---|---|---|---|
+| `tools/birefnet-hr-test/` UI and synthetic test graphics | PhotoCraft BiRefNet HR test interface | PhotoCraft contributors | Original implementation in this repository | MIT OR Apache-2.0 |
+| Runtime model download (not committed) | BiRefNet_HR-matting | Peng Zheng and BiRefNet contributors | https://huggingface.co/ZhengPeng7/BiRefNet_HR-matting | MIT; notice in `tools/birefnet-hr-test/licenses/BiRefNet-MIT.txt` |
+| Pinned runtime ONNX conversion (not committed) | BiRefNet HR Matting ONNX, revision 792518b9d4dfe9793891712677de25e554f948c6 | Pink Pixel; upstream BiRefNet authors | https://huggingface.co/PinkPixel/birefnet-hr-matting-onnx | MIT; notice in `tools/birefnet-hr-test/licenses/BiRefNet-ONNX-MIT.txt` |
+| Runtime CDN dependency (not committed) | ONNX Runtime Web 1.23.2 | Microsoft Corporation | https://github.com/microsoft/onnxruntime/tree/v1.23.2 | MIT; notice in `tools/birefnet-hr-test/licenses/ONNX-Runtime-MIT.txt` |

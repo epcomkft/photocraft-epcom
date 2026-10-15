@@ -1,0 +1,109 @@
+import { MODEL_SIZE, validateSize, normalizeRgb, readModelAlpha, resizeAlpha, exportAlpha } from './core.mjs';
+import { composeCutout } from './edge-colors.mjs';
+import { adaptPinnedModel } from './onnx-compat.mjs';
+
+const MODEL_REV = '792518b9d4dfe9793891712677de25e554f948c6';
+const MODEL_URL = `https://huggingface.co/PinkPixel/birefnet-hr-matting-onnx/resolve/${MODEL_REV}/model_fp16.onnx`;
+const MODEL_BYTES = 471320622;
+const MODEL_HASH = 'c0216070c15542b7197bcf13eb3ea07af0fc5595c591037b7c9766c3cc6470f0';
+const CACHE_NAME = 'photocraft-birefnet-hr-v1';
+const RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.webgpu.min.mjs';
+let source = null, matte = null, running = false;
+function progress(id, message, value) { self.postMessage({ type: 'progress', id, message, value }); }
+async function modelBytes(id) {
+  let cache = null, response = null;
+  try { cache = await caches.open(CACHE_NAME); response = await cache.match(MODEL_URL); } catch { /* Cache is optional (private mode / quota). */ }
+  const cached = !!response;
+  if (!response) response = await fetch(MODEL_URL, { credentials: 'omit', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(600_000) });
+  if (!response.ok || !response.body) throw new Error('A modell nem tölthető le. Ellenőrizd az internetkapcsolatot és a huggingface.co elérhetőségét.');
+  const reader = response.body.getReader(), data = new Uint8Array(MODEL_BYTES);
+  let offset = 0, last = 0;
+  try {
+    while (true) {
+      let timer;
+      const next = await Promise.race([reader.read(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('A modell letöltése megállt. Próbáld újra.')), 90_000); })]).finally(() => clearTimeout(timer));
+      if (next.done) break;
+      if (offset + next.value.length > data.length) throw new Error('A letöltött modell mérete eltér a várt változattól.');
+      data.set(next.value, offset); offset += next.value.length;
+      if (performance.now() - last > 150) {
+        progress(id, `${cached ? 'Modell a gyorsítótárból' : 'Modell letöltése'}: ${Math.round(offset / 1e6)} / 471 MB`, .04 + .32 * offset / data.length); last = performance.now();
+      }
+    }
+  } catch (error) { await reader.cancel().catch(() => {}); throw error; }
+  if (offset !== data.length) { await cache?.delete(MODEL_URL); throw new Error('A modellletöltés hiányos. Indítsd újra.'); }
+  progress(id, 'A modell épségének ellenőrzése…', .37);
+  const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', data))].map(b => b.toString(16).padStart(2, '0')).join('');
+  if (digest !== MODEL_HASH) { await cache?.delete(MODEL_URL); throw new Error('A modell ellenőrzőösszege hibás. Indítsd újra a letöltést.'); }
+  if (!cached && cache) {
+    try { await cache.put(MODEL_URL, new Response(data, { headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(data.length) } })); }
+    catch { self.postMessage({ type: 'notice', id, message: 'A modell nem fért a gyorsítótárba. Ez a feldolgozást nem akadályozza; legközelebb újra letöltjük.' }); }
+  }
+  return data;
+}
+function compose(id, strength, includeRaw) {
+  if (!source || !matte) throw new Error('Előbb futtasd le a háttéreltávolítást.');
+  if (!Number.isFinite(strength) || strength < 0 || strength > 1) throw new Error('Hibás peremtisztítási erősség.');
+  const result = composeCutout(source, matte, strength);
+  const alpha = exportAlpha(result.data);
+  const payload = { type: 'result', id, width: source.width, height: source.height, rgba: result.data.buffer, alpha: alpha.buffer, strength };
+  const transfers = [payload.rgba, payload.alpha];
+  if (includeRaw) { payload.raw = composeCutout(source, matte, 0).data.buffer; transfers.push(payload.raw); }
+  self.postMessage(payload, transfers);
+}
+async function run(message) {
+  const { id, width, height, rgba } = message;
+  validateSize(width, height);
+  if (!(rgba instanceof ArrayBuffer) || rgba.byteLength !== width * height * 4) throw new Error('Hibás képadat érkezett.');
+  source = { data: new Uint8ClampedArray(rgba), width, height, channels: 4 }; matte = null;
+  progress(id, 'Videokártya ellenőrzése…', .01);
+  const adapter = await self.navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('Nem érhető el WebGPU. Asztali Chrome, Edge vagy Opera böngészőben, HTTPS alatt, bekapcsolt hardveres gyorsítással próbáld.');
+  if (!adapter.features.has('shader-f16')) throw new Error('Ez a videokártya vagy böngésző nem támogatja a HR modell FP16 futtatását. Frissítsd a böngészőt és a videokártya illesztőprogramját.');
+  const ort = await import(RUNTIME_URL);
+  ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false;
+  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
+  ort.env.webgpu.adapter = adapter; ort.env.webgpu.powerPreference = 'high-performance';
+  ort.env.logLevel = 'error';
+  let bytes = await modelBytes(id);
+  progress(id, 'Böngészős modell előkészítése…', .40);
+  let compatible = adaptPinnedModel(bytes); bytes = null;
+  let session, input, outputs;
+  try {
+    progress(id, 'HR modell betöltése a videokártyára…', .46);
+    session = await ort.InferenceSession.create(compatible, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all', enableCpuMemArena: false, enableMemPattern: false });
+    compatible = null;
+    if (session.inputNames.join(',') !== 'image' || session.outputNames.join(',') !== 'alpha') throw new Error('Eltérő modellbemenet vagy -kimenet.');
+    const original = new OffscreenCanvas(width, height), resized = new OffscreenCanvas(MODEL_SIZE, MODEL_SIZE);
+    original.getContext('2d').putImageData(new ImageData(source.data, width, height), 0, 0);
+    const ctx = resized.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, MODEL_SIZE, MODEL_SIZE);
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    // Matches upstream's square Resize(2048,2048); output restored to original size.
+    ctx.drawImage(original, 0, 0, MODEL_SIZE, MODEL_SIZE);
+    input = new ort.Tensor('float32', normalizeRgb(ctx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data, MODEL_SIZE, MODEL_SIZE), [1, 3, MODEL_SIZE, MODEL_SIZE]);
+    original.width = original.height = resized.width = resized.height = 1;
+    progress(id, 'BiRefNet HR-matting dolgozik · 2048 × 2048 px…', .60);
+    const start = performance.now(); outputs = await session.run({ image: input });
+    const seconds = (performance.now() - start) / 1000;
+    const floats = readModelAlpha(outputs.alpha);
+    progress(id, 'Eredeti képméret és átlátszóság visszaállítása…', .92);
+    matte = resizeAlpha(floats, MODEL_SIZE, MODEL_SIZE, width, height);
+    self.postMessage({ type: 'metrics', id, seconds, model: 'BiRefNet_HR-matting', revision: MODEL_REV, size: MODEL_SIZE, precision: 'FP16 / FP32 I/O', backend: 'WebGPU' });
+  } finally {
+    input?.dispose(); for (const output of Object.values(outputs ?? {})) output?.dispose();
+    await session?.release();
+  }
+  progress(id, 'Átlátszó PNG előnézet készítése…', .97);
+  compose(id, message.strength, true);
+}
+self.addEventListener('message', async ({ data }) => {
+  if (running || !['run', 'compose'].includes(data?.type)) return;
+  running = true;
+  try { if (data.type === 'run') await run(data); else compose(data.id, data.strength, false); }
+  catch (error) {
+    const detail = String(error?.message ?? error).slice(0, 1400);
+    const memory = /memory|allocation|buffer.*size|device.*lost|out of|ResourceExhausted/i.test(detail);
+    self.postMessage({ type: 'error', id: data.id, message: memory ? 'A HR modellhez most nincs elég elérhető memória, vagy megszakadt a GPU-kapcsolat. Zárd be a többi képszerkesztőt és GPU-t használó lapot, majd próbáld újra.' : detail, detail });
+  } finally { running = false; }
+});
+self.postMessage({ type: 'ready' });
