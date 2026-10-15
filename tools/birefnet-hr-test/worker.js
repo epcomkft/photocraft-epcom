@@ -43,7 +43,7 @@ function readModelAlpha(tensor) {
   }
   stats.min = Number.isFinite(min) ? min : null; stats.max = Number.isFinite(max) ? max : null;
   if (stats.invalid) {
-    const error = new Error(`A GPU számítása érvénytelen alfamaszkot adott (${stats.invalid} / ${stats.total} hibás képpont). A hibajelentés a „Peremtisztítás és ellenőrzés” részből letölthető.`);
+    const error = new Error(`A GPU számítása érvénytelen alfamaszkot adott (${stats.invalid} / ${stats.total} hibás képpont). A hibajelentés a „Hibajelentés és diagnosztika” részből letölthető.`);
     error.code = 'MODEL_ALPHA_INVALID'; error.alphaStats = stats; throw error;
   }
   const out = new Float32Array(tensor.data.length);
@@ -70,62 +70,161 @@ function exportAlpha(rgba) {
   return out;
 }
 
-// edge-colors.mjs
-// Bounded, two-pass Manhattan nearest-seed field. No full-image colour blur:
-// unrelated subject/background pixels cannot bleed into opaque areas.
-function nearest(alpha, w, h, foreground, radius) {
-  const n = w * h, index = new Int32Array(n), distance = new Uint16Array(n);
-  index.fill(-1); distance.fill(radius + 1);
-  for (let i = 0; i < n; i++) {
-    if (foreground ? alpha[i] >= 250 : alpha[i] <= 1) { index[i] = i; distance[i] = 0; }
+// foreground.mjs
+// Fast Multi-Level Foreground Estimation, Germer et al. (2020).
+// Adapted from PyMatting (c) 2020 PyMatting, MIT; see licenses/PyMatting-MIT.txt.
+// Reference source blob: c117f291779fcf2c8b01997dbc84c2a0c5f5b699.
+// A deterministic serial solve in a Web Worker. This estimates colours only:
+// alpha is never thresholded, eroded, blurred or regenerated.
+
+
+function estimateForeground(source, alpha, width, height) {
+  validateSize(width, height);
+  if (!(source instanceof Uint8ClampedArray || source instanceof Uint8Array) || source.length !== width * height * 4 || !(alpha instanceof Uint8ClampedArray || alpha instanceof Uint8Array) || alpha.length !== width * height) throw new Error('Hibás szín- vagy alfamaszkadat.');
+  const count = width * height;
+  let fc = 0, bc = 0;
+  let previousF = new Float32Array(3), previousB = new Float32Array(3);
+  for (let i = 0; i < count; i++) {
+    if (alpha[i] > 229) { fc++; for (let c = 0; c < 3; c++) previousF[c] += source[i * 4 + c] / 255; }
+    if (alpha[i] < 26) { bc++; for (let c = 0; c < 3; c++) previousB[c] += source[i * 4 + c] / 255; }
   }
-  const take = (i, j) => {
-    const d = distance[j] + 1;
-    if (d < distance[i] && d <= radius) { distance[i] = d; index[i] = index[j]; }
-  };
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const i = y * w + x;
-    if (x) take(i, i - 1);
-    if (y) take(i, i - w);
+  // Without both classes no colour separation is identifiable. Keep original RGB.
+  if (!fc || !bc) return null;
+  for (let c = 0; c < 3; c++) { previousF[c] /= fc; previousB[c] /= bc; }
+  let oldW = 1, oldH = 1;
+  const levels = Math.max(1, Math.ceil(Math.log2(Math.max(width, height))));
+  const neighbours = new Int32Array(4), weights = new Float64Array(4);
+  for (let level = 0; level <= levels; level++) {
+    const w = Math.round(width ** (level / levels)), h = Math.round(height ** (level / levels));
+    const n = w * h, f = new Float32Array(n * 3), b = new Float32Array(n * 3);
+    const a = new Float32Array(n), indices = new Uint32Array(n);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, original = Math.floor(y * height / h) * width + Math.floor(x * width / w);
+      indices[i] = original * 4; a[i] = alpha[original] / 255;
+      const old = (Math.floor(y * oldH / h) * oldW + Math.floor(x * oldW / w)) * 3;
+      for (let c = 0; c < 3; c++) { f[i * 3 + c] = previousF[old + c]; b[i * 3 + c] = previousB[old + c]; }
+    }
+    // Only two colour fields for this level and its predecessor are live. Clear
+    // the predecessor references before the expensive full-resolution passes.
+    previousF = previousB = null;
+    const iterations = w <= 32 && h <= 32 ? 10 : 2;
+    for (let iter = 0; iter < iterations; iter++) {
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const i = y * w + x, af = a[i], ab = 1 - af;
+        neighbours[0] = x ? i - 1 : i; neighbours[1] = x + 1 < w ? i + 1 : i;
+        neighbours[2] = y ? i - w : i; neighbours[3] = y + 1 < h ? i + w : i;
+        let regularizer = 0;
+        for (let k = 0; k < 4; k++) { const weight = 1e-5 + Math.abs(af - a[neighbours[k]]); weights[k] = weight; regularizer += weight; }
+        const ff = af * af + regularizer, bb = ab * ab + regularizer, fb = af * ab;
+        const determinant = ff * bb - fb * fb;
+        if (!(determinant > 0) || !Number.isFinite(determinant)) throw new Error('A szegélyszín-becslés nem adott érvényes eredményt.');
+        for (let c = 0; c < 3; c++) {
+          const observed = source[indices[i] + c] / 255;
+          let rhsF = af * observed, rhsB = ab * observed;
+          for (let k = 0; k < 4; k++) { const q = neighbours[k] * 3 + c; rhsF += weights[k] * f[q]; rhsB += weights[k] * b[q]; }
+          f[i * 3 + c] = Math.max(0, Math.min(1, (bb * rhsF - fb * rhsB) / determinant));
+          b[i * 3 + c] = Math.max(0, Math.min(1, (ff * rhsB - fb * rhsF) / determinant));
+        }
+      }
+    }
+    previousF = f; previousB = b; oldW = w; oldH = h;
   }
-  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
-    const i = y * w + x;
-    if (x + 1 < w) take(i, i + 1);
-    if (y + 1 < h) take(i, i + w);
-  }
-  return index;
+  const result = new Uint8ClampedArray(count * 3);
+  for (let i = 0; i < result.length; i++) result[i] = previousF[i] * 255;
+  return result;
 }
 
-// C = alpha * F + (1-alpha) * B. Estimate local B and regularise F towards a
-// nearby opaque foreground colour; never divide tiny alphas without a prior.
-// Only partially covered boundary pixels change. PNG RGB is straight, not premultiplied.
-function composeCutout(source, matte, strength = .8) {
-  const { width: w, height: h, data: a } = mask(matte.data, matte.width, matte.height);
-  if (source.width !== w || source.height !== h || source.channels !== 4 || source.data.length !== w * h * 4) {
-    throw new Error('A színkép és az alfamaszk mérete eltér.');
-  }
-  if (!Number.isFinite(strength) || strength < 0 || strength > 1) throw new Error('Érvénytelen szegélyszín-korrekció.');
-  const out = new Uint8ClampedArray(source.data);
-  // Transparent input has no reliable background RGB. Preserve its colour/alpha.
-  let opaqueSource = true;
-  for (let i = 0; i < a.length; i++) if (source.data[i * 4 + 3] !== 255) { opaqueSource = false; break; }
-  const radius = clamp(Math.round(Math.max(w, h) / 64), 8, 64);
-  const bg = strength && opaqueSource ? nearest(a, w, h, false, radius) : null;
-  const fg = bg ? nearest(a, w, h, true, radius) : null;
-  for (let i = 0; i < a.length; i++) {
-    const p = i * 4, alpha = a[i] / 255;
-    out[p + 3] = alpha * source.data[p + 3];
-    if (!out[p + 3]) { out[p] = out[p + 1] = out[p + 2] = 0; continue; }
-    if (!bg || alpha >= .98 || bg[i] < 0 || fg[i] < 0) continue;
-    const lambda = .02 * (1 - alpha) ** 2 + .001;
-    for (let c = 0; c < 3; c++) {
-      const observed = source.data[p + c], background = source.data[bg[i] * 4 + c];
-      const prior = source.data[fg[i] * 4 + c];
-      const estimate = clamp((alpha * (observed - (1 - alpha) * background) + lambda * prior) / (alpha * alpha + lambda), 0, 255);
-      out[p + c] = observed + strength * (estimate - observed);
+// edge-colors.mjs
+function nearestSeeds(w, h, radius, seed) {
+  const n = w * h, index = new Int32Array(n), distance = new Uint16Array(n);
+  index.fill(-1); distance.fill(radius + 1);
+  for (let i = 0; i < n; i++) if (seed(i)) { index[i] = i; distance[i] = 0; }
+  const take = (i, j) => { const d = distance[j] + 1; if (d < distance[i] && d <= radius) { distance[i] = d; index[i] = index[j]; } };
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x; if (x) take(i, i - 1); if (y) take(i, i - w); }
+  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) { const i = y * w + x; if (x + 1 < w) take(i, i + 1); if (y + 1 < h) take(i, i + w); }
+  return { index, distance };
+}
+
+// A high model alpha can still contain background colour. Use a small patch
+// safely inside the foreground, and correct only colours that fit its local
+// foreground/background mixture. This changes RGB, never the matte boundary.
+function removeResidualSpill(rgb, source, a, w, h) {
+  const radius = clamp(Math.round(Math.max(w, h) / 32), 12, 96);
+  const inset = clamp(Math.round(Math.max(w, h) / 400), 2, 8);
+  const boundary = nearestSeeds(w, h, inset, i => a[i] < 254);
+  const fg = nearestSeeds(w, h, radius, i => a[i] >= 254 && boundary.distance[i] >= inset).index;
+  const bg = nearestSeeds(w, h, radius, i => a[i] <= 1).index;
+  const f = new Float64Array(3), b = new Float64Array(3);
+  const patch = (at, isForeground, out) => {
+    out.fill(0); let count = 0;
+    const x0 = at % w, y0 = Math.floor(at / w);
+    for (let y = Math.max(0, y0 - 1); y <= Math.min(h - 1, y0 + 1); y++) {
+      for (let x = Math.max(0, x0 - 1); x <= Math.min(w - 1, x0 + 1); x++) {
+        const i = y * w + x;
+        if (isForeground ? a[i] < 254 : a[i] > 1) continue;
+        for (let c = 0; c < 3; c++) out[c] += source[i * 4 + c];
+        count++;
+      }
     }
+    for (let c = 0; c < 3; c++) out[c] /= Math.max(count, 1);
+  };
+  for (let i = 0; i < a.length; i++) {
+    if (!a[i] || a[i] === 255 || fg[i] < 0 || bg[i] < 0) continue;
+    patch(fg[i], true, f); patch(bg[i], false, b);
+    let contrast2 = 0, projection = 0;
+    for (let c = 0; c < 3; c++) { const d = f[c] - b[c]; contrast2 += d * d; projection += (source[i * 4 + c] - b[c]) * d; }
+    const contrast = Math.sqrt(contrast2);
+    if (contrast < 24) continue;
+    const coverage = clamp(projection / contrast2, 0, 1);
+    let residual2 = 0;
+    for (let c = 0; c < 3; c++) residual2 += (source[i * 4 + c] - (coverage * f[c] + (1 - coverage) * b[c])) ** 2;
+    const fit = clamp(1 - Math.sqrt(residual2) / (contrast * .25 + 4), 0, 1);
+    const confidence = fit * clamp((a[i] / 255 - coverage - .05) / .2, 0, 1) * clamp((contrast - 24) / 48, 0, 1);
+    for (let c = 0; c < 3; c++) rgb[i * 3 + c] += confidence * (f[c] - rgb[i * 3 + c]);
   }
-  return { data: out, width: w, height: h, channels: 4 };
+  return rgb;
+}
+
+function createEdgeCleaner(source, matte) {
+  const { width: w, height: h, data: a } = mask(matte.data, matte.width, matte.height);
+  if (source.width !== w || source.height !== h || source.channels !== 4 || !(source.data instanceof Uint8ClampedArray || source.data instanceof Uint8Array) || source.data.length !== w * h * 4) throw new Error('A színkép és az alfamaszk mérete eltér.');
+  let prepared = false, colors = null;
+  const info = { method: 'multilevel-local-spill-v4', status: 'not-needed', preparations: 0, milliseconds: 0 };
+  return {
+    info,
+    compose(strength = 0) {
+      if (!Number.isFinite(strength) || strength < 0 || strength > 1) throw new Error('Érvénytelen szegélyszín-korrekció.');
+      if (strength > 0 && !prepared) {
+        const start = performance.now();
+        let opaque = true, partial = false;
+        for (let i = 0; i < a.length; i++) { if (source.data[i * 4 + 3] !== 255) opaque = false; if (a[i] > 0 && a[i] < 255) partial = true; }
+        // Existing transparent PNG colours are already foreground colours; its
+        // transparent RGB cannot be treated as a photographed background.
+        if (!opaque) info.status = 'transparent-source';
+        else if (!partial) info.status = 'no-soft-edge';
+        else {
+          colors = estimateForeground(source.data, a, w, h);
+          if (colors) removeResidualSpill(colors, source.data, a, w, h);
+          info.status = colors ? 'ready' : 'insufficient-context';
+        }
+        info.milliseconds = performance.now() - start; info.preparations++; prepared = true;
+      }
+      const out = new Uint8ClampedArray(source.data);
+      for (let i = 0; i < a.length; i++) {
+        const p = i * 4;
+        out[p + 3] = a[i] / 255 * source.data[p + 3];
+        if (!out[p + 3]) { out[p] = out[p + 1] = out[p + 2] = 0; continue; }
+        // Opaque interiors are byte-identical, independent of strength.
+        if (!colors || !strength || a[i] === 255) continue;
+        for (let c = 0; c < 3; c++) out[p + c] = source.data[p + c] + strength * (colors[i * 3 + c] - source.data[p + c]);
+      }
+      return { data: out, width: w, height: h, channels: 4 };
+    }
+  };
+}
+
+function composeCutout(source, matte, strength = 0) {
+  return createEdgeCleaner(source, matte).compose(strength);
 }
 
 // onnx-compat.mjs
@@ -345,7 +444,7 @@ const MODEL_BYTES = 932150975;
 const MODEL_HASH = 'a548a1f3307250766bef50b174026b3cfa39a695bc1e42ec131c14fe82797ffd';
 const CACHE_NAME = 'photocraft-birefnet-hr-fp32-v2';
 const RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.webgpu.min.mjs';
-let source = null, matte = null, running = false, diagnostic = null;
+let source = null, matte = null, running = false, diagnostic = null, cleaner = null;
 function progress(id, message, value) { if (diagnostic) diagnostic.stage = message; self.postMessage({ type: 'progress', id, message, value }); }
 function report(id) { self.postMessage({ type: 'diagnostics', id, report: diagnostic }); }
 async function modelBytes(id) {
@@ -383,20 +482,22 @@ async function modelBytes(id) {
 function compose(id, strength, includeRaw) {
   if (!source || !matte) throw new Error('Előbb futtasd le a háttéreltávolítást.');
   if (!Number.isFinite(strength) || strength < 0 || strength > 1) throw new Error('Hibás peremtisztítási erősség.');
-  const result = composeCutout(source, matte, strength);
+  if (!cleaner) cleaner = createEdgeCleaner(source, matte);
+  const result = cleaner.compose(strength);
+  if (diagnostic) { diagnostic.edgeCleanup = { ...cleaner.info, strength }; report(id); }
   const alpha = exportAlpha(result.data);
-  const payload = { type: 'result', id, width: source.width, height: source.height, rgba: result.data.buffer, alpha: alpha.buffer, strength };
+  const payload = { type: 'result', id, width: source.width, height: source.height, rgba: result.data.buffer, alpha: alpha.buffer, strength, cleanup: { ...cleaner.info } };
   const transfers = [payload.rgba, payload.alpha];
-  if (includeRaw) { payload.raw = composeCutout(source, matte, 0).data.buffer; transfers.push(payload.raw); }
+  if (includeRaw) { payload.raw = cleaner.compose(0).data.buffer; transfers.push(payload.raw); }
   self.postMessage(payload, transfers);
 }
 async function run(message) {
   const { id, width, height, rgba } = message;
-  diagnostic = { appVersion: '3.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', memoryOptimization: 'project-before-resize-v3', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
+  diagnostic = { appVersion: '4.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', memoryOptimization: 'project-before-resize-v3', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
   report(id);
   validateSize(width, height);
   if (!(rgba instanceof ArrayBuffer) || rgba.byteLength !== width * height * 4) throw new Error('Hibás képadat érkezett.');
-  source = { data: new Uint8ClampedArray(rgba), width, height, channels: 4 }; matte = null;
+  source = { data: new Uint8ClampedArray(rgba), width, height, channels: 4 }; matte = null; cleaner = null;
   progress(id, 'Videokártya ellenőrzése…', .01);
   const adapter = await self.navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('Nem érhető el WebGPU. Asztali Chrome, Edge vagy Opera böngészőben, HTTPS alatt, bekapcsolt hardveres gyorsítással próbáld.');
@@ -458,4 +559,4 @@ self.addEventListener('message', async ({ data }) => {
     self.postMessage({ type: 'error', id: data.id, message: failure.message, detail: failure.detail });
   } finally { running = false; }
 });
-self.postMessage({ type: 'ready', version: '3.0.0' });
+self.postMessage({ type: 'ready', version: '4.0.0' });

@@ -1,5 +1,5 @@
 import { MODEL_SIZE, validateSize, normalizeRgb, readModelAlpha, resizeAlpha, exportAlpha } from './core.mjs';
-import { composeCutout } from './edge-colors.mjs';
+import { createEdgeCleaner } from './edge-colors.mjs';
 import { adaptPinnedModel } from './onnx-compat.mjs';
 import { gpuLimits, classifyGpuError } from './gpu-errors.mjs';
 
@@ -10,7 +10,7 @@ const MODEL_BYTES = 932150975;
 const MODEL_HASH = 'a548a1f3307250766bef50b174026b3cfa39a695bc1e42ec131c14fe82797ffd';
 const CACHE_NAME = 'photocraft-birefnet-hr-fp32-v2';
 const RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.webgpu.min.mjs';
-let source = null, matte = null, running = false, diagnostic = null;
+let source = null, matte = null, running = false, diagnostic = null, cleaner = null;
 function progress(id, message, value) { if (diagnostic) diagnostic.stage = message; self.postMessage({ type: 'progress', id, message, value }); }
 function report(id) { self.postMessage({ type: 'diagnostics', id, report: diagnostic }); }
 async function modelBytes(id) {
@@ -48,20 +48,22 @@ async function modelBytes(id) {
 function compose(id, strength, includeRaw) {
   if (!source || !matte) throw new Error('Előbb futtasd le a háttéreltávolítást.');
   if (!Number.isFinite(strength) || strength < 0 || strength > 1) throw new Error('Hibás peremtisztítási erősség.');
-  const result = composeCutout(source, matte, strength);
+  if (!cleaner) cleaner = createEdgeCleaner(source, matte);
+  const result = cleaner.compose(strength);
+  if (diagnostic) { diagnostic.edgeCleanup = { ...cleaner.info, strength }; report(id); }
   const alpha = exportAlpha(result.data);
-  const payload = { type: 'result', id, width: source.width, height: source.height, rgba: result.data.buffer, alpha: alpha.buffer, strength };
+  const payload = { type: 'result', id, width: source.width, height: source.height, rgba: result.data.buffer, alpha: alpha.buffer, strength, cleanup: { ...cleaner.info } };
   const transfers = [payload.rgba, payload.alpha];
-  if (includeRaw) { payload.raw = composeCutout(source, matte, 0).data.buffer; transfers.push(payload.raw); }
+  if (includeRaw) { payload.raw = cleaner.compose(0).data.buffer; transfers.push(payload.raw); }
   self.postMessage(payload, transfers);
 }
 async function run(message) {
   const { id, width, height, rgba } = message;
-  diagnostic = { appVersion: '3.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', memoryOptimization: 'project-before-resize-v3', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
+  diagnostic = { appVersion: '4.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', memoryOptimization: 'project-before-resize-v3', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
   report(id);
   validateSize(width, height);
   if (!(rgba instanceof ArrayBuffer) || rgba.byteLength !== width * height * 4) throw new Error('Hibás képadat érkezett.');
-  source = { data: new Uint8ClampedArray(rgba), width, height, channels: 4 }; matte = null;
+  source = { data: new Uint8ClampedArray(rgba), width, height, channels: 4 }; matte = null; cleaner = null;
   progress(id, 'Videokártya ellenőrzése…', .01);
   const adapter = await self.navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('Nem érhető el WebGPU. Asztali Chrome, Edge vagy Opera böngészőben, HTTPS alatt, bekapcsolt hardveres gyorsítással próbáld.');
@@ -123,4 +125,4 @@ self.addEventListener('message', async ({ data }) => {
     self.postMessage({ type: 'error', id: data.id, message: failure.message, detail: failure.detail });
   } finally { running = false; }
 });
-self.postMessage({ type: 'ready', version: '3.0.0' });
+self.postMessage({ type: 'ready', version: '4.0.0' });

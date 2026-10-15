@@ -76,7 +76,7 @@ test('real worker forwards the exact reported buffer limit as GPU_BUFFER_LIMIT',
   const result = await exercise(new Float32Array(2048*2048), {runError});
   assert.equal(result.events.some(e=>e.type==='result'),false);
   const report=result.events.filter(e=>e.type==='diagnostics').at(-1).report;
-  assert.equal(report.appVersion,'3.0.0');assert.equal(report.memoryOptimization,'project-before-resize-v3');
+  assert.equal(report.appVersion,'4.0.0');assert.equal(report.memoryOptimization,'project-before-resize-v3');
   assert.equal(report.error.code,'GPU_BUFFER_LIMIT');assert.equal(report.error.buffer.limit,2147483648);
   assert.doesNotMatch(result.events.find(e=>e.type==='error').message,/Zárd be/);
   assert.equal(result.releases,1);

@@ -40,7 +40,7 @@ export function readModelAlpha(tensor) {
   }
   stats.min = Number.isFinite(min) ? min : null; stats.max = Number.isFinite(max) ? max : null;
   if (stats.invalid) {
-    const error = new Error(`A GPU számítása érvénytelen alfamaszkot adott (${stats.invalid} / ${stats.total} hibás képpont). A hibajelentés a „Peremtisztítás és ellenőrzés” részből letölthető.`);
+    const error = new Error(`A GPU számítása érvénytelen alfamaszkot adott (${stats.invalid} / ${stats.total} hibás képpont). A hibajelentés a „Hibajelentés és diagnosztika” részből letölthető.`);
     error.code = 'MODEL_ALPHA_INVALID'; error.alphaStats = stats; throw error;
   }
   const out = new Float32Array(tensor.data.length);

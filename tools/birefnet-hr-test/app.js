@@ -1,17 +1,18 @@
-/* PhotoCraft BiRefNet HR v3 / FP32. Classic script: no local .mjs MIME dependency. */
+/* PhotoCraft BiRefNet HR v4 / FP32. Classic script: no local .mjs MIME dependency. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
   let source = null, raw = null, corrected = null, alpha = null, reference = null;
   let worker = null, ready = null, busy = false, loading = false, job = 0, loadId = 0;
   let sourceName = 'kep', clock = null, started = 0, metrics = null, appliedStrength = 0;
-  let diagnosticReport = null;
+  let diagnosticReport = null, composing = false, requestedStrength = 0, composeTimer = null;
   function status(message, value) { $('status').textContent = message; if (Number.isFinite(value)) $('progress').value = value; }
   function controls() {
     $('file').disabled = busy; $('run').disabled = busy || loading || !source || !navigator.gpu || !isSecureContext;
     $('cancel').disabled = !busy; $('referenceFile').disabled = busy || loading || !source;
-    $('strength').disabled = busy || !raw || !worker; $('clearCache').disabled = busy;
-    $('download').disabled = $('downloadMask').disabled = busy || !raw;
+    $('strength').disabled = (busy && !composing) || !raw || !worker; $('clearCache').disabled = busy;
+    document.querySelectorAll('[data-strength]').forEach(button => { button.disabled = $('strength').disabled; button.setAttribute('aria-pressed', String(Number(button.dataset.strength) === requestedStrength)); });
+    $('download').disabled = $('downloadMask').disabled = busy || !raw || requestedStrength !== appliedStrength;
     $('downloadReport').disabled = !diagnosticReport;
   }
   function setBusy(value) {
@@ -34,7 +35,7 @@
   }
   function zoom() { document.querySelectorAll('.stage-inner').forEach(el => { el.style.width = !source || $('zoom').value === 'fit' ? '100%' : `${source.width * Number($('zoom').value)}px`; }); }
   function removeReference() { reference = null; $('referenceFile').value = ''; $('referenceCard').hidden = true; $('comparison').classList.remove('has-reference'); $('reference').width = $('reference').height = 1; }
-  function stopWorker() { worker?.terminate(); worker = null; ready = null; }
+  function stopWorker() { worker?.terminate(); worker = null; ready = null; composing = false; clearTimeout(composeTimer); requestedStrength = appliedStrength; $('strength').value = String(appliedStrength); $('strengthValue').value = `${appliedStrength}%`; }
   function fail(error) { status(`Hiba: ${String(error?.message ?? error)}`, 0); setBusy(false); }
   function showDiagnostics(report) {
     diagnosticReport = { ...report, browser: navigator.userAgent };
@@ -43,7 +44,7 @@
   }
   async function getWorker() {
     if (ready) return ready;
-    const instance = new Worker('./worker.js?v=3'); worker = instance;
+    const instance = new Worker('./worker.js?v=4'); worker = instance;
     ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => { reject(new Error('A feldolgozó nem indult el. Ellenőrizd, hogy a worker.js is fel van töltve.')); }, 12000);
       instance.addEventListener('error', event => {
@@ -52,7 +53,7 @@
       });
       instance.addEventListener('message', ({ data }) => {
         if (worker !== instance) return;
-        if (data.type === 'ready') { clearTimeout(timer); if (data.version !== '3.0.0') { reject(new Error('Eltérő verziójú feldolgozó töltődött be. A v3 csomag összes fájlját másold felül, majd frissíts Ctrl+Shift+R-rel.')); return; } resolve(instance); return; }
+        if (data.type === 'ready') { clearTimeout(timer); if (data.version !== '4.0.0') { reject(new Error('Eltérő verziójú feldolgozó töltődött be. A v4 csomag összes fájlját másold felül, majd frissíts Ctrl+Shift+R-rel.')); return; } resolve(instance); return; }
         if (data.id !== job) return;
         if (data.type === 'progress') status(data.message, data.value);
         else if (data.type === 'notice') { $('notice').hidden = false; $('notice').textContent = data.message; }
@@ -63,7 +64,12 @@
           if (!source || data.width !== source.width || data.height !== source.height || data.rgba?.byteLength !== source.width * source.height * 4 || data.alpha?.byteLength !== source.width * source.height) { stopWorker(); fail(new Error('Az eredmény mérete hibás.')); return; }
           if (data.raw) raw = new Uint8ClampedArray(data.raw);
           corrected = new Uint8ClampedArray(data.rgba); alpha = new Uint8ClampedArray(data.alpha); appliedStrength = Math.round(data.strength * 100);
-          $('resultEmpty').hidden = true; render(); setBusy(false);
+          $('resultEmpty').hidden = true; render();
+          const note = data.cleanup?.status === 'transparent-source' ? 'A feltöltött kép már átlátszó: a színeit megőrizzük, peremtisztítást nem alkalmazunk.' : data.cleanup?.status === 'insufficient-context' ? 'Nincs elegendő biztos előtér és háttér a színbecsléshez. Az eredeti színek maradtak.' : data.cleanup?.status === 'no-soft-edge' ? 'Nincs félig átlátszó szegély, amelyen a színkorrekció változtatna.' : '';
+          $('cleanupNote').textContent = note; $('cleanupNote').hidden = !note;
+          composing = false;
+          if (requestedStrength !== appliedStrength) { startCompose(); return; }
+          setBusy(false);
           status('Kész. Ellenőrizd a haj- és szőrszálakat fehér és fekete háttéren, 100–200%-os nézetben.', 1);
         }
       });
@@ -86,8 +92,8 @@
     const version = ++loadId; job++; stopWorker(); loading = true; source = raw = corrected = alpha = null; metrics = diagnosticReport = null; removeReference();
     for (const id of ['original', 'result']) $(id).width = $(id).height = 1;
     $('originalEmpty').hidden = $('resultEmpty').hidden = false; $('notice').hidden = true; $('timer').textContent = ''; started = 0;
-    $('strength').value = '0'; $('strengthValue').value = '0%'; $('resultMode').value = 'raw'; appliedStrength = 0;
-    $('diagnostics').textContent = 'v3 · BiRefNet_HR-matting · 2048 × 2048 · FP32'; controls(); status('Kép betöltése…', 0);
+    $('strength').value = '0'; $('strengthValue').value = '0%'; $('resultMode').value = 'raw'; appliedStrength = requestedStrength = 0; $('cleanupNote').hidden = true;
+    $('diagnostics').textContent = 'v4 · BiRefNet_HR-matting · 2048 × 2048 · FP32'; controls(); status('Kép betöltése…', 0);
     try {
       const image = await readFile(file); if (version !== loadId) return; source = image;
       sourceName = file.name.replace(/\.[^.]+$/, '').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_') || 'kep';
@@ -103,7 +109,7 @@
     // succeeded. Preserve the source/reference, discard only derived results.
     raw = corrected = alpha = null; metrics = diagnosticReport = null;
     $('result').width = $('result').height = 1; $('resultEmpty').hidden = false;
-    $('diagnostics').textContent = 'v3 · FP32 feldolgozás indul…';
+    $('diagnostics').textContent = 'v4 · FP32 feldolgozás indul…';
     setBusy(true); $('notice').hidden = true;
     try {
       const active = await getWorker(); if (id !== job) return;
@@ -112,12 +118,24 @@
     } catch (error) { if (id === job) fail(error); }
   });
   $('cancel').addEventListener('click', () => { if (!busy) return; job++; stopWorker(); setBusy(false); status('Megszakítva. Az eredeti kép megmaradt, újraindíthatod a feldolgozást.', 0); });
-  $('strength').addEventListener('input', () => { $('strengthValue').value = `${$('strength').value}%`; });
-  $('strength').addEventListener('change', () => {
-    if (busy || !worker || !raw) return;
-    $('resultMode').value = 'corrected'; setBusy(true); status('Szegélyszín tisztítása · a modell újrafuttatása nélkül…', .95);
-    worker.postMessage({ type: 'compose', id: ++job, strength: Number($('strength').value) / 100 });
-  });
+  function startCompose() {
+    clearTimeout(composeTimer);
+    if (composing || !worker || !raw) return;
+    $('resultMode').value = 'corrected';
+    if (requestedStrength === appliedStrength) { render(); controls(); return; }
+    composing = true; setBusy(true); status('Peremtisztítás frissítése · a modell újrafuttatása nélkül…', .95);
+    worker.postMessage({ type: 'compose', id: ++job, strength: requestedStrength / 100 });
+  }
+  function requestCleanup(value, immediate = false) {
+    if (!worker || !raw || (busy && !composing)) return;
+    requestedStrength = Math.max(0, Math.min(100, Number(value)));
+    $('strength').value = String(requestedStrength); $('strengthValue').value = `${requestedStrength}%`;
+    controls(); clearTimeout(composeTimer);
+    if (immediate) startCompose(); else composeTimer = setTimeout(startCompose, 120);
+  }
+  $('strength').addEventListener('input', () => requestCleanup($('strength').value));
+  $('strength').addEventListener('change', () => requestCleanup($('strength').value, true));
+  document.querySelectorAll('[data-strength]').forEach(button => button.addEventListener('click', () => requestCleanup(button.dataset.strength, true)));
   $('referenceFile').addEventListener('change', async () => {
     const file = $('referenceFile').files?.[0]; if (!file || busy || !source) return;
     const version = loadId;
@@ -136,12 +154,12 @@
     requestAnimationFrame(() => { scrolling = false; });
   }));
   async function download(isMask) {
-    if (!raw || busy) return;
+    if (!raw || busy || requestedStrength !== appliedStrength) return;
     try {
       const mode = $('resultMode').value, canvas = document.createElement('canvas');
       draw(isMask ? grayMask(alpha) : mode === 'raw' ? raw : corrected, canvas);
       const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png')); if (!blob) throw new Error('A PNG nem hozható létre.');
-      const url = URL.createObjectURL(blob), link = document.createElement('a'); link.href = url; link.download = `${sourceName}-birefnet-hr-${isMask ? 'alfamaszk' : mode === 'raw' ? 'nyers' : 'tisztitott'}.png`; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+      const url = URL.createObjectURL(blob), link = document.createElement('a'); link.href = url; link.download = `${sourceName}-birefnet-hr-v4-${isMask ? 'alfamaszk' : mode === 'raw' ? 'nyers' : `tisztitott-${appliedStrength}pct`}.png`; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
     } catch (error) { fail(error); }
   }
   $('download').addEventListener('click', () => download(false)); $('downloadMask').addEventListener('click', () => download(true));
@@ -149,10 +167,10 @@
     if (!diagnosticReport) return;
     const blob = new Blob([JSON.stringify(diagnosticReport, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob), link = document.createElement('a');
-    link.href = url; link.download = 'photocraft-birefnet-v3-hibajelentes.json'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+    link.href = url; link.download = 'photocraft-birefnet-v4-hibajelentes.json'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
   });
   $('clearCache').addEventListener('click', async () => { if (busy) return; try { await caches.delete('photocraft-birefnet-hr-v1'); await caches.delete('photocraft-birefnet-hr-fp32-v2'); status('Modellgyorsítótár törölve. A következő futás újra letölti az FP32 modellt.'); } catch { status('A böngésző nem engedi a gyorsítótár kezelését.'); } });
   window.addEventListener('pagehide', () => { stopWorker(); clearInterval(clock); });
-  $('gpu').textContent = !isSecureContext ? 'HTTPS címen nyisd meg ezt az oldalt. Helyi teszthez localhost használható.' : !navigator.gpu ? 'WebGPU nem érhető el. Próbáld asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással.' : 'v3 · FP32 · csökkentett pufferigény. A v2-ben már letöltött modell újra használható. Első letöltés: kb. 932 MB; a feldolgozás a saját videokártyádon fut.';
+  $('gpu').textContent = !isSecureContext ? 'HTTPS címen nyisd meg ezt az oldalt. Helyi teszthez localhost használható.' : !navigator.gpu ? 'WebGPU nem érhető el. Próbáld asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással.' : 'v4 · FP32 · csökkentett pufferigény. A korábban letöltött FP32 modell újra használható. Első letöltés: kb. 932 MB; a feldolgozás a saját videokártyádon fut.';
   controls(); document.documentElement.dataset.appReady = '1'; status('Válaszd ki az eredeti fotót.', 0);
 })();
