@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 
-async function exercise(values, { gpu = true, createError = null } = {}) {
+async function exercise(values, { gpu = true, createError = null, runError = null } = {}) {
   let handler, options, releases = 0, disposals = 0;
   const events = [], pixels = new Uint8ClampedArray(2048 * 2048 * 4).fill(255);
   class Canvas {
@@ -17,7 +17,7 @@ async function exercise(values, { gpu = true, createError = null } = {}) {
     Tensor: class { dispose() { disposals++; } },
     InferenceSession: { async create(bytes, config) {
       options = config; if (createError) throw createError;
-      return { inputNames: ['image'], outputNames: ['alpha'], async run() { return { alpha: tensor }; }, async release() { releases++; } };
+      return { inputNames: ['image'], outputNames: ['alpha'], async run() { if (runError) throw runError; return { alpha: tensor }; }, async release() { releases++; } };
     } }
   };
   const self = { navigator: { gpu: gpu ? { async requestAdapter() { return { features: new Set(), info: { vendor: 'test' } }; } } : undefined },
@@ -69,4 +69,15 @@ test('missing WebGPU and session allocation failure leave no result and return a
     assert.ok(result.events.some(e => e.type === 'error'));
     assert.equal(result.events.filter(e => e.type === 'diagnostics').at(-1).report.result, 'error');
   }
+});
+
+test('real worker forwards the exact reported buffer limit as GPU_BUFFER_LIMIT', async () => {
+  const runError = new Error('WebGPU validation failed. Buffer size (3221225472) exceeds the max buffer size limit (2147483648).');
+  const result = await exercise(new Float32Array(2048*2048), {runError});
+  assert.equal(result.events.some(e=>e.type==='result'),false);
+  const report=result.events.filter(e=>e.type==='diagnostics').at(-1).report;
+  assert.equal(report.appVersion,'3.0.0');assert.equal(report.memoryOptimization,'project-before-resize-v3');
+  assert.equal(report.error.code,'GPU_BUFFER_LIMIT');assert.equal(report.error.buffer.limit,2147483648);
+  assert.doesNotMatch(result.events.find(e=>e.type==='error').message,/Zárd be/);
+  assert.equal(result.releases,1);
 });

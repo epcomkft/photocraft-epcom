@@ -1,6 +1,7 @@
 import { MODEL_SIZE, validateSize, normalizeRgb, readModelAlpha, resizeAlpha, exportAlpha } from './core.mjs';
 import { composeCutout } from './edge-colors.mjs';
 import { adaptPinnedModel } from './onnx-compat.mjs';
+import { gpuLimits, classifyGpuError } from './gpu-errors.mjs';
 
 const MODEL_REV = '792518b9d4dfe9793891712677de25e554f948c6';
 // Use the publisher's actual FP32 reference, not FP16 weights cast back to FP32.
@@ -56,7 +57,7 @@ function compose(id, strength, includeRaw) {
 }
 async function run(message) {
   const { id, width, height, rgba } = message;
-  diagnostic = { appVersion: '2.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
+  diagnostic = { appVersion: '3.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', memoryOptimization: 'project-before-resize-v3', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
   report(id);
   validateSize(width, height);
   if (!(rgba instanceof ArrayBuffer) || rgba.byteLength !== width * height * 4) throw new Error('Hibás képadat érkezett.');
@@ -68,14 +69,14 @@ async function run(message) {
   // of invalid masks. Half-precision arithmetic can also overflow on some GPUs.
   const info = adapter.info;
   diagnostic.gpu = info ? { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description } : null;
-  diagnostic.shaderF16Available = adapter.features.has('shader-f16'); report(id);
+  diagnostic.shaderF16Available = adapter.features.has('shader-f16'); diagnostic.adapterLimits = gpuLimits(adapter.limits); report(id);
   const ort = await import(RUNTIME_URL);
   ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false;
   ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
   ort.env.webgpu.adapter = adapter; ort.env.webgpu.powerPreference = 'high-performance';
   ort.env.logLevel = 'error';
   let bytes = await modelBytes(id);
-  progress(id, 'Böngészős modell előkészítése…', .40);
+  progress(id, 'A HR modell memóriaigényének csökkentése…', .40);
   let compatible = adaptPinnedModel(bytes); bytes = null;
   let session, input, outputs;
   try {
@@ -84,6 +85,7 @@ async function run(message) {
     // folding; never silently replace NaN pixels or lower the model resolution.
     session = await ort.InferenceSession.create(compatible, { executionProviders: ['webgpu'], graphOptimizationLevel: 'basic', enableCpuMemArena: false, enableMemPattern: false });
     compatible = null;
+    diagnostic.deviceLimits = gpuLimits(ort.env.webgpu.device?.limits); report(id);
     if (session.inputNames.join(',') !== 'image' || session.outputNames.join(',') !== 'alpha') throw new Error('Eltérő modellbemenet vagy -kimenet.');
     const original = new OffscreenCanvas(width, height), resized = new OffscreenCanvas(MODEL_SIZE, MODEL_SIZE);
     original.getContext('2d').putImageData(new ImageData(source.data, width, height), 0, 0);
@@ -116,10 +118,9 @@ self.addEventListener('message', async ({ data }) => {
   running = true;
   try { if (data.type === 'run') await run(data); else compose(data.id, data.strength, false); }
   catch (error) {
-    const detail = String(error?.message ?? error).slice(0, 1400);
-    const memory = /memory|allocation|buffer.*size|device.*lost|out of|ResourceExhausted/i.test(detail);
-    if (diagnostic) { diagnostic.result = 'error'; diagnostic.error = { code: error?.code ?? 'INFERENCE_ERROR', message: detail, alphaStats: error?.alphaStats ?? null }; report(data.id); }
-    self.postMessage({ type: 'error', id: data.id, message: memory ? 'Az FP32 HR modellhez most nincs elég elérhető memória, vagy megszakadt a GPU-kapcsolat. Zárd be a többi képszerkesztőt és GPU-t használó lapot, majd próbáld újra.' : detail, detail });
+    const failure = classifyGpuError(error);
+    if (diagnostic) { diagnostic.result = 'error'; diagnostic.error = { code: failure.code, message: failure.detail, buffer: failure.buffer ?? null, alphaStats: error?.alphaStats ?? null }; report(data.id); }
+    self.postMessage({ type: 'error', id: data.id, message: failure.message, detail: failure.detail });
   } finally { running = false; }
 });
-self.postMessage({ type: 'ready' });
+self.postMessage({ type: 'ready', version: '3.0.0' });

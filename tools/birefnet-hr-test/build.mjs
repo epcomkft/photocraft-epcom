@@ -1,5 +1,5 @@
 import { readFile, writeFile } from 'node:fs/promises';
-const names = ['core.mjs', 'edge-colors.mjs', 'onnx-compat.mjs', 'worker-source.mjs'];
+const names = ['core.mjs', 'edge-colors.mjs', 'onnx-compat.mjs', 'gpu-errors.mjs', 'worker-source.mjs'];
 const parts = [];
 for (const name of names) {
   const content = (await readFile(new URL(name, import.meta.url), 'utf8')).replace(/^import .+ from ['"].+['"];\s*$/gm, '').replace(/^export (?=(?:async )?function |const )/gm, '');

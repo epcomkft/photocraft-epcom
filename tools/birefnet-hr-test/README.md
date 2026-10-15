@@ -1,23 +1,29 @@
-# PhotoCraft · BiRefNet HR-matting teszt v2 · FP32
+# PhotoCraft · BiRefNet HR-matting teszt v3 · FP32
 
 Külön telepíthető, böngészőben működő összehasonlító változat. Az eredeti BEN2 / ViTMatte teszt mappájától függetlenül működik.
 
-## Frissítés v1-ről
+## Frissítés v2-ről
 
-A v1-ben jelzett „A modell érvénytelen átlátszósági értéket adott” hiba azt jelenti, hogy a modell Sigmoid utáni kimenetében nem véges vagy tartományon kívüli érték volt. A rövid üzenet nem árulta el, melyik történt; ebből a pontos GPU-ok nem bizonyítható.
+A kapott hibajelentés konkrét oka: a modell egy **3 GiB-os GPU-puffert** próbált létrehozni a böngésző **2 GiB-os, egyetlen pufferre vonatkozó korlátja** mellett. Ez a korlát nem azonos a videokártya 16 GB összmemóriájával. A v2 általános memóriahiba-üzenete ezt pontatlanul fogalmazta meg.
 
-A v2 az exportáló **teljes FP32 referenciafájlját** használja, FP16 számítás és haladó gráffúziók nélkül (`basic` optimalizálás). A felbontás továbbra is 2048 × 2048. Nem javítjuk át a hibás képpontokat nullára, és nem alkalmazunk második Sigmoidot. A teljes HR-modell tényleges GPU-futását ebben a fejlesztői környezetben nem igazoltuk; az eredményt ugyanazzal a fotóval a saját gépeden ellenőrizd.
+A v3 a kimeneti 1×1 csatornaösszegzést a bilineáris nagyítás elé helyezi. Így a 192 teljes méretű csatorna 3 GiB-os puffere és az azt követő 240 csatornás, 3,75 GiB-os összefűzés sem készül el. A modell továbbra is **2048 × 2048, FP32**; nincs felbontáscsökkentés, FP16 visszakapcsolás vagy hibás pixelek kitöltése. A két részeredményt a végén összeadjuk, majd az eredeti Sigmoid következik.
 
-Másold felül a tesztmappa **összes fájlját**, majd **Ctrl+Shift+R**. A fejlécben **v2 · FP32** jelenjen meg. A régi FP16 modellgyorsítótárat a program automatikusan elengedi. Az első v2 futás új, kb. 932 MB-os modellt tölt le; kézzel nem kell modellt feltölteni.
+A matematikai átrendezést valódi ONNX Runtime CPU-számítással, nyolc kis részgráfos tesztben ellenőriztük. A legnagyobb alfaeltérés 0,00000149 volt. Ez részgráf-ellenőrzés, nem teljes, fizikai GPU-s minőségi teszt.
 
-Ha újra hiba történik, a **Peremtisztítás és ellenőrzés → Hibajelentés letöltése** gombbal mentsd a JSON-t. Tartalmazza a modell, a futtatás és a hibás alfaértékek adatait, de a képet és a fájlnevét nem. A jelentés nem kerül automatikusan elküldésre.
+1. Másold felül a tesztmappa **összes fájlját**, majd **Ctrl+Shift+R**.
+2. A fejlécben **v3 · FP32** jelenjen meg.
+3. Indítsd újra ugyanazzal a fotóval, elsőként 0% peremtisztítással.
+
+**A v2 modellgyorsítótárát nem kell törölni:** ugyanazt az ellenőrzött FP32 modellt használjuk, az illesztés a böngészőben készül. Ha a böngésző megőrizte a modellt, nincs új letöltés. Az új felület ellenőrzi a worker verzióját is, így egy részleges feltöltésre külön üzenetet ad.
+
+Ha további hiba történik, a **Peremtisztítás és ellenőrzés → Hibajelentés letöltése** gombbal mentsd a JSON-t. Tartalmazza a GPU adapter és eszköz elérhető pufferkorlátait, a modellváltozatot és a hiba típusát. A fotó és a fájlneve nem kerül bele; semmit nem küldünk el automatikusan.
 
 ## Telepítés
 
 1. Hozd létre az `admin/photocraft-birefnet-test/` mappát a tárhelyen.
 2. A ZIP-ben lévő `photocraft-birefnet-test` mappa tartalmát töltsd bele. A működéshez az **index.html, app.js, worker.js és style.css** kell, ugyanabban a mappában. A `licenses` mappát és ezt a leírást is tartsd meg.
 3. Nyisd meg: `https://epcom.hu/admin/photocraft-birefnet-test/`.
-4. Asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással teszteld. A videokártyának WebGPU támogatás kell. A v2 már nem igényel `shader-f16` támogatást.
+4. Asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással teszteld. A videokártyának WebGPU támogatás kell. A v3 sem igényel `shader-f16` támogatást.
 
 A tárhelyen nem kell Node.js, Python, telepítő, cron, API-kulcs vagy GPU. A számítás a saját géped videokártyáján fut. A kép nem kerül külső képfeldolgozó API-ra. A modell a Hugging Face-ről, a futtatókörnyezet a jsDelivr-ről töltődik le; ezekhez internet kell.
 
@@ -55,16 +61,18 @@ Ez önálló HTML tesztoldal, nem használja a PHP admin bejelentkezését, és 
 - A teljes kép 2048 × 2048 pixelre méretezve, ImageNet RGB normalizálással kerül a modellbe. FP32 súlyok, számítás, bemenet és kimenet; `basic` gráfoptimalizálás. A kimenet már Sigmoid aktiválást tartalmaz, nem alkalmazzuk újra.
 - Az alpha fokozatos marad, nem vágjuk bináris maszkká. Nem fut rajta automatikus trimap-zárolás, foltszűrés vagy újabb ViTMatte. Ez lehetővé teszi a modell önálló megítélését.
 - A maszkot az eredeti képmérethez interpoláljuk, és összeszorozzuk az eredeti PNG alfájával. Opcionális szegélyszín-korrekció alkalmazható.
-- A böngészős kompatibilitási adapter az export 300 darab 2D `GridSample` műveletét az azonos bilineáris opset-19 formára alakítja, és 48 pontos GELU műveletet az ONNX Runtime azonos `com.microsoft::Gelu` műveletéhez rendel. Ellenőrzi a függőségeket, és topológiailag rendezi a gráfot. **A modellsúlyok bájtról bájtra változatlanok.** Eltérő modellrevíziót vagy nem várt gráfot elutasít.
+- A böngészős kompatibilitási adapter az export 300 darab 2D `GridSample` műveletét az azonos bilineáris opset-19 formára alakítja, és 48 pontos GELU műveletet az ONNX Runtime azonos `com.microsoft::Gelu` műveletéhez rendel. Ellenőrzi a függőségeket, és topológiailag rendezi a gráfot. **A modellsúlyok bájtról bájtra változatlanok.** Eltérő modellrevíziót vagy nem várt gráfot elutasít. A végső 1×1 vetítés súlyából két új, bájtpontos csatornaszeletet képez, és egy apró indexkonstanst ad hozzá. A már érvényes eredeti műveleti sorrendet megőrzi.
 
 ## Fejlesztés és ellenőrzés
 
-Az `app.js` kézzel szerkesztett classic felületkód. A `worker.js` a `core.mjs`, `edge-colors.mjs`, `onnx-compat.mjs`, `worker-source.mjs` állományokból generált classic csomag. A tárhelyen csak a generált `.js` fájlok töltődnek be; a forrás `.mjs` fájlokat nem szükséges feltölteni.
+Az `app.js` kézzel szerkesztett classic felületkód. A `worker.js` a `core.mjs`, `edge-colors.mjs`, `onnx-compat.mjs`, `gpu-errors.mjs`, `worker-source.mjs` állományokból generált classic csomag. A tárhelyen csak a generált `.js` fájlok töltődnek be; a forrás `.mjs` fájlokat nem szükséges feltölteni.
 
 ```sh
 node build.mjs
 node build.mjs --check
-node --test tests/core.test.mjs tests/worker.test.mjs
+node --test tests/core.test.mjs tests/worker.test.mjs tests/gpu-errors.test.mjs
+# onnx, onnxruntime, numpy tesztfüggőségekkel:
+python tests/head.test.py
 # Playwright és @napi-rs/canvas tesztfüggőségekkel:
 BROWSER_EXECUTABLE=/path/to/chromium node tests/browser.cjs
 ```

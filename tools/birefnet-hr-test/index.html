@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>PhotoCraft · BiRefNet HR teszt</title>
-  <link rel="stylesheet" href="./style.css?v=2">
+  <link rel="stylesheet" href="./style.css?v=3">
 </head>
 <body>
 <main class="wrap">
-  <header><div><p class="eyebrow">PhotoCraft / külön tesztverzió · v2 · FP32</p><h1>Finom részletek.<br><span>BiRefNet HR-matting.</span></h1><p class="intro">Haj, szőr és áttetsző szélek · 2048 × 2048 pixeles modellelemzés</p></div><div class="privacy"><span class="dot"></span>A képed a gépeden marad</div></header>
+  <header><div><p class="eyebrow">PhotoCraft / külön tesztverzió · v3 · FP32</p><h1>Finom részletek.<br><span>BiRefNet HR-matting.</span></h1><p class="intro">Haj, szőr és áttetsző szélek · 2048 × 2048 pixeles modellelemzés</p></div><div class="privacy"><span class="dot"></span>A képed a gépeden marad</div></header>
   <section class="panel controls">
     <div class="actions"><label class="file primary">Eredeti kép kiválasztása<input id="file" type="file" accept="image/jpeg,image/png,image/webp" disabled></label><span id="dimensions" class="muted">JPG, PNG, WebP · legfeljebb 16 MP / 40 MB</span><button id="run" disabled>Háttér eltávolítása</button><button id="cancel" class="quiet" disabled>Megszakítás</button></div>
     <div class="status-row"><span id="status" role="status" aria-live="polite">A tesztoldal betöltése…</span><span id="timer" class="muted"></span></div>
     <progress id="progress" value="0" max="1" aria-label="Feldolgozás"></progress>
-    <p id="gpu" class="hint">Az első futás kb. 932 MB modellt tölt le. Ez a változat FP32 pontossággal, WebGPU-val számol.</p><p id="notice" class="hint" hidden></p>
-    <details><summary>Peremtisztítás és ellenőrzés</summary><div class="settings"><label>Szegélyszín tisztítása <output id="strengthValue">0%</output><input id="strength" type="range" min="0" max="100" step="5" value="0" disabled><small>0%: változatlan modellkimenet. Emeléskor csak a félig átlátszó szélek színe változik.</small></label><div><p class="hint">Először 0%-kal hasonlítsd össze. Az eredeti méret és az eredeti PNG átlátszósága megmarad.</p><button id="clearCache" class="quiet">Modellgyorsítótár törlése</button></div></div><pre id="diagnostics">v2 · BiRefNet_HR-matting · 2048 × 2048 · FP32</pre><button id="downloadReport" class="quiet" disabled>Hibajelentés letöltése</button><p class="hint">A jelentés technikai adatokat tartalmaz. A fotó és a fájlneve nem kerül bele; semmit nem küldünk el automatikusan.</p></details>
+    <p id="gpu" class="hint">FP32, csökkentett pufferigénnyel. A v2 modellgyorsítótára újra használható; első letöltés kb. 932 MB.</p><p id="notice" class="hint" hidden></p>
+    <details><summary>Peremtisztítás és ellenőrzés</summary><div class="settings"><label>Szegélyszín tisztítása <output id="strengthValue">0%</output><input id="strength" type="range" min="0" max="100" step="5" value="0" disabled><small>0%: változatlan modellkimenet. Emeléskor csak a félig átlátszó szélek színe változik.</small></label><div><p class="hint">Először 0%-kal hasonlítsd össze. Az eredeti méret és az eredeti PNG átlátszósága megmarad.</p><button id="clearCache" class="quiet">Modellgyorsítótár törlése</button></div></div><pre id="diagnostics">v3 · BiRefNet_HR-matting · 2048 × 2048 · FP32</pre><button id="downloadReport" class="quiet" disabled>Hibajelentés letöltése</button><p class="hint">A jelentés technikai adatokat tartalmaz. A fotó és a fájlneve nem kerül bele; semmit nem küldünk el automatikusan.</p></details>
   </section>
   <section class="viewbar" aria-label="Nézet és összehasonlítás">
     <label>Nézet<select id="resultMode"><option value="raw">Nyers BiRefNet eredmény</option><option value="corrected">Peremtisztított eredmény</option></select></label>
@@ -27,7 +27,7 @@
     <article id="referenceCard" hidden><div class="card-title"><h2>Korábbi kivágás</h2><button id="removeReference" class="quiet" aria-label="Összehasonlító kép eltávolítása">Eltávolítás</button></div><div class="stage output" data-background="checker"><div class="stage-inner"><canvas id="reference" width="1" height="1" aria-label="Korábbi háttéreltávolítás"></canvas></div></div></article>
   </section>
   <section class="exportbar"><div><strong>Eredeti méretű export</strong><p>A választott előnézeti háttér nem kerül bele a PNG-be.</p></div><div class="actions"><button id="download" class="primary" disabled>Átlátszó PNG letöltése</button><button id="downloadMask" disabled>Alfamaszk PNG</button></div></section>
-  <footer><span>PhotoCraft · BiRefNet HR teszt v2</span><span>Helyi feldolgozás · API-kulcs nélkül</span></footer>
+  <footer><span>PhotoCraft · BiRefNet HR teszt v3</span><span>Helyi feldolgozás · API-kulcs nélkül</span></footer>
 </main>
 <script>
 (function () {
@@ -35,6 +35,6 @@
   window.addEventListener('error', failed, true); setTimeout(failed, 10000);
 })();
 </script>
-<script id="app-script" defer src="./app.js?v=2"></script>
+<script id="app-script" defer src="./app.js?v=3"></script>
 </body>
 </html>

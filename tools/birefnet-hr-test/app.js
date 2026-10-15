@@ -1,4 +1,4 @@
-/* PhotoCraft BiRefNet HR v2 / FP32. Classic script: no local .mjs MIME dependency. */
+/* PhotoCraft BiRefNet HR v3 / FP32. Classic script: no local .mjs MIME dependency. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
@@ -43,7 +43,7 @@
   }
   async function getWorker() {
     if (ready) return ready;
-    const instance = new Worker('./worker.js?v=2'); worker = instance;
+    const instance = new Worker('./worker.js?v=3'); worker = instance;
     ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => { reject(new Error('A feldolgozó nem indult el. Ellenőrizd, hogy a worker.js is fel van töltve.')); }, 12000);
       instance.addEventListener('error', event => {
@@ -52,7 +52,7 @@
       });
       instance.addEventListener('message', ({ data }) => {
         if (worker !== instance) return;
-        if (data.type === 'ready') { clearTimeout(timer); resolve(instance); return; }
+        if (data.type === 'ready') { clearTimeout(timer); if (data.version !== '3.0.0') { reject(new Error('Eltérő verziójú feldolgozó töltődött be. A v3 csomag összes fájlját másold felül, majd frissíts Ctrl+Shift+R-rel.')); return; } resolve(instance); return; }
         if (data.id !== job) return;
         if (data.type === 'progress') status(data.message, data.value);
         else if (data.type === 'notice') { $('notice').hidden = false; $('notice').textContent = data.message; }
@@ -87,7 +87,7 @@
     for (const id of ['original', 'result']) $(id).width = $(id).height = 1;
     $('originalEmpty').hidden = $('resultEmpty').hidden = false; $('notice').hidden = true; $('timer').textContent = ''; started = 0;
     $('strength').value = '0'; $('strengthValue').value = '0%'; $('resultMode').value = 'raw'; appliedStrength = 0;
-    $('diagnostics').textContent = 'v2 · BiRefNet_HR-matting · 2048 × 2048 · FP32'; controls(); status('Kép betöltése…', 0);
+    $('diagnostics').textContent = 'v3 · BiRefNet_HR-matting · 2048 × 2048 · FP32'; controls(); status('Kép betöltése…', 0);
     try {
       const image = await readFile(file); if (version !== loadId) return; source = image;
       sourceName = file.name.replace(/\.[^.]+$/, '').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_') || 'kep';
@@ -103,7 +103,7 @@
     // succeeded. Preserve the source/reference, discard only derived results.
     raw = corrected = alpha = null; metrics = diagnosticReport = null;
     $('result').width = $('result').height = 1; $('resultEmpty').hidden = false;
-    $('diagnostics').textContent = 'v2 · FP32 feldolgozás indul…';
+    $('diagnostics').textContent = 'v3 · FP32 feldolgozás indul…';
     setBusy(true); $('notice').hidden = true;
     try {
       const active = await getWorker(); if (id !== job) return;
@@ -149,10 +149,10 @@
     if (!diagnosticReport) return;
     const blob = new Blob([JSON.stringify(diagnosticReport, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob), link = document.createElement('a');
-    link.href = url; link.download = 'photocraft-birefnet-v2-hibajelentes.json'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+    link.href = url; link.download = 'photocraft-birefnet-v3-hibajelentes.json'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
   });
   $('clearCache').addEventListener('click', async () => { if (busy) return; try { await caches.delete('photocraft-birefnet-hr-v1'); await caches.delete('photocraft-birefnet-hr-fp32-v2'); status('Modellgyorsítótár törölve. A következő futás újra letölti az FP32 modellt.'); } catch { status('A böngésző nem engedi a gyorsítótár kezelését.'); } });
   window.addEventListener('pagehide', () => { stopWorker(); clearInterval(clock); });
-  $('gpu').textContent = !isSecureContext ? 'HTTPS címen nyisd meg ezt az oldalt. Helyi teszthez localhost használható.' : !navigator.gpu ? 'WebGPU nem érhető el. Próbáld asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással.' : 'v2 · FP32 számítás. Első futás: kb. 932 MB modellletöltés. A feldolgozás a saját videokártyádon fut; több memóriát használ, mint az előző FP16 változat.';
+  $('gpu').textContent = !isSecureContext ? 'HTTPS címen nyisd meg ezt az oldalt. Helyi teszthez localhost használható.' : !navigator.gpu ? 'WebGPU nem érhető el. Próbáld asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással.' : 'v3 · FP32 · csökkentett pufferigény. A v2-ben már letöltött modell újra használható. Első letöltés: kb. 932 MB; a feldolgozás a saját videokártyádon fut.';
   controls(); document.documentElement.dataset.appReady = '1'; status('Válaszd ki az eredeti fotót.', 0);
 })();

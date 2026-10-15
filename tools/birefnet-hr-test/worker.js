@@ -132,7 +132,8 @@ function composeCutout(source, matte, strength = .8) {
 // Narrow, zero-copy protobuf traversal for the pinned PinkPixel FP32 export only.
 // ORT WebGPU 1.23.2 supports GridSample 16-19 (2D bilinear), not opset 20
 // (renames this mode 'linear'). Map exact GELU to the equivalent Microsoft op.
-// Initializers are retained byte-for-byte. No weights or inference precision change.
+// Original initializers are retained byte-for-byte. The high-resolution head
+// adds two byte-exact channel slices of its 1x1 weights and one index constant.
 const utf8 = new TextDecoder(), encode = new TextEncoder();
 function varint(bytes, start, end) {
   let n = 0, factor = 1, p = start;
@@ -165,6 +166,84 @@ function field(id, body) { return join([vint(id * 8 + 2), vint(body.length), bod
 function str(id, text) { return field(id, encode.encode(text)); }
 function num(id, n) { return join([vint(id * 8), vint(n)]); }
 function textField(list, id) { const f = list.find(f => f.id === id); return f ? utf8.decode(f.data) : ''; }
+function strings(list, id) { return list.filter(f => f.id === id).map(f => utf8.decode(f.data)); }
+function makeNode(name, op, inputs, outputs, attrs = []) {
+  const body = join([...inputs.map(s => str(1, s)), ...outputs.map(s => str(2, s)), str(3, name), str(4, op), ...attrs]);
+  return { fields: fields(body), raw: field(1, body) };
+}
+function integerAttribute(name, value) { return field(5, join([str(1, name), num(3, value), num(20, 2)])); }
+function tensorDims(list) {
+  const result = [];
+  for (const f of list.filter(f => f.id === 1)) {
+    if (f.wire === 0) result.push(f.number);
+    else if (f.wire === 2) { let p = 0; while (p < f.data.length) { let n; [n, p] = varint(f.data, p, f.data.length); result.push(n); } }
+    else throw new Error('Hibás modellsúly-méret.');
+  }
+  return result;
+}
+function rewriteHighResolutionHead(nodes, other) {
+  // Linear 1x1 channel projection commutes with per-channel bilinear Resize:
+  // W*[Resize(x), y] + b = Resize(Wx*x) + Wy*y + b.
+  // v2 allocated 3 GiB for Resize(x), then 3.75 GiB for the concatenation.
+  // Keep the same 2048px output and FP32 arithmetic without either tensor.
+  const root = '/model/decoder/', prefix = 'photocraft_hr_head_v3/';
+  const names = { resize: root + 'Resize_7', concat: root + 'Concat_27', conv: root + 'conv_out1/conv_out1.0/Conv', shapeA: root + 'Shape_20', shapeB: root + 'Shape_21' };
+  const byName = new Map(nodes.map(n => [textField(n.fields, 3), n]));
+  function required(name, op) { const n = byName.get(name); if (!n || textField(n.fields, 4) !== op) throw new Error('Eltérő HR kimeneti gráf; a memóriaoptimalizálás leállt.'); return n; }
+  const resize = required(names.resize, 'Resize'), concat = required(names.concat, 'Concat'), conv = required(names.conv, 'Conv');
+  const shapes = [required(names.shapeA, 'Shape'), required(names.shapeB, 'Shape')];
+  const ri = strings(resize.fields, 1), ro = strings(resize.fields, 2), ci = strings(concat.fields, 1), co = strings(concat.fields, 2), wi = strings(conv.fields, 1), wo = strings(conv.fields, 2);
+  const attributes = n => n.fields.filter(f => f.id === 5).map(f => fields(f.data));
+  const attr = (n, name) => attributes(n).find(a => textField(a, 1) === name);
+  if (ri.length !== 4 || ri[1] || ri[2] || !ri[3] || ro.length !== 1 || ci.length !== 2 || ci[0] !== ro[0] || co.length !== 1 || wi.length !== 3 || wi[0] !== co[0] || wo.length !== 1 ||
+      textField(attr(resize, 'mode') ?? [], 4) !== 'linear' || textField(attr(resize, 'coordinate_transformation_mode') ?? [], 4) !== 'align_corners' ||
+      attr(concat, 'axis')?.find(f => f.id === 3)?.number !== 1 ||
+      shapes.some(n => strings(n.fields, 1).join(',') !== ro[0])) throw new Error('Váratlan HR kimeneti művelet.');
+  const consumers = output => nodes.filter(n => strings(n.fields, 1).includes(output)).map(n => textField(n.fields, 3)).sort().join(',');
+  if (consumers(ro[0]) !== [names.concat, names.shapeA, names.shapeB].sort().join(',') || consumers(co[0]) !== names.conv) throw new Error('A HR kimenetnek nem várt felhasználója van.');
+  // Enforce the exact 1x1, stride-one, no-padding projection before commuting it.
+  const expectedConv = { dilations: [1, 1], group: 1, kernel_shape: [1, 1], pads: [0, 0, 0, 0], strides: [1, 1] };
+  if (attributes(conv).length !== 5) throw new Error('Eltérő HR vetítési paraméterek.');
+  for (const [name, value] of Object.entries(expectedConv)) {
+    const a = attr(conv, name);
+    const actual = Array.isArray(value) ? a?.filter(f => f.id === 8).flatMap(f => {
+      if (f.wire === 0) return [f.number]; let p = 0; const values = []; while (p < f.data.length) { let n; [n, p] = varint(f.data, p, f.data.length); values.push(n); } return values;
+    }) : a?.find(f => f.id === 3)?.number;
+    if (JSON.stringify(actual) !== JSON.stringify(value)) throw new Error('A HR vetítés nem az elvárt 1×1 művelet.');
+  }
+  const weight = other.find(f => f.id === 5 && textField(fields(f.data), 8) === wi[1]);
+  if (!weight) throw new Error('Hiányzó HR vetítési súlyok.');
+  const wf = fields(weight.data), raw = wf.find(f => f.id === 9)?.data;
+  if (tensorDims(wf).join(',') !== '1,240,1,1' || wf.find(f => f.id === 2)?.number !== 1 || raw?.length !== 960) throw new Error('Eltérő HR vetítési súlyméret.');
+  function addTensor(name, dims, type, payload) {
+    const body = join([...dims.map(d => num(1, d)), num(2, type), str(8, name), payload]);
+    other.push({ id: 5, data: body, raw: field(5, body) });
+  }
+  const wl = prefix + 'low_weight', wh = prefix + 'high_weight', indices = prefix + 'size_indices';
+  addTensor(wl, [1, 192, 1, 1], 1, field(9, raw.subarray(0, 192 * 4)));
+  addTensor(wh, [1, 48, 1, 1], 1, field(9, raw.subarray(192 * 4)));
+  addTensor(indices, [4], 7, join([0, 0, 2, 3].map(i => num(7, i))));
+  const low = prefix + 'low', size = prefix + 'size', up = prefix + 'upsampled', high = prefix + 'high';
+  const convAttrs = conv.fields.filter(f => f.id === 5).map(f => f.raw), resizeAttrs = resize.fields.filter(f => f.id === 5).map(f => f.raw);
+  const result = [];
+  for (const n of nodes) {
+    const name = textField(n.fields, 3);
+    if (name === names.resize) {
+      result.push(makeNode(prefix + 'ProjectLow', 'Conv', [ri[0], wl], [low], convAttrs));
+      // The pinned graph has batch=1: gather [N,N,H,W] gives [1,1,H,W].
+      result.push(makeNode(prefix + 'ProjectedSize', 'Gather', [ri[3], indices], [size], [integerAttribute('axis', 0)]));
+      result.push(makeNode(prefix + 'ResizeProjected', 'Resize', [low, '', '', size], [up], resizeAttrs));
+    } else if (name === names.shapeA || name === names.shapeB) {
+      // Shape of the removed Resize is exactly its original sizes argument.
+      result.push(makeNode(name, 'Identity', [ri[3]], strings(n.fields, 2)));
+    } else if (name === names.concat) { /* Never materialize 240 full-size channels. */ }
+    else if (name === names.conv) {
+      result.push(makeNode(prefix + 'ProjectHigh', 'Conv', [ci[1], wh, wi[2]], [high], convAttrs));
+      result.push(makeNode(prefix + 'Combine', 'Add', [up, high], wo));
+    } else result.push(n);
+  }
+  return result;
+}
 function sortNodes(nodes, other) {
   // Preserve dependency order explicitly. This also rejects broken/cyclic graphs.
   const producers = new Map(), sources = new Set();
@@ -173,6 +252,14 @@ function sortNodes(nodes, other) {
     if (f.id === 5) sources.add(textField(fields(f.data), 8));
   }
   nodes.forEach((n, i) => { for (const f of n.fields) if (f.id === 2) { const name = utf8.decode(f.data); if (producers.has(name)) throw new Error('Ismétlődő ONNX kimenet.'); producers.set(name, i); } });
+  // FP32 is already topologically ordered. Preserve that execution schedule:
+  // breadth-first reordering needlessly extends activation lifetimes.
+  const available = new Set(sources); let ordered = true;
+  for (const n of nodes) {
+    if (strings(n.fields, 1).some(name => name && !available.has(name))) { ordered = false; break; }
+    for (const name of strings(n.fields, 2)) available.add(name);
+  }
+  if (ordered) return nodes.map(n => n.raw);
   const counts = new Uint32Array(nodes.length), edges = Array.from({ length: nodes.length }, () => []), ready = [];
   nodes.forEach((n, i) => {
     const dependencies = new Set();
@@ -216,7 +303,8 @@ function adaptPinnedModel(bytes) {
     } else nodes.push({ raw: f.raw, fields: n });
   }
   if (grids !== 300 || gelus !== 48) throw new Error('Eltérő modellváltozat; a böngészős illesztés leállt.');
-  const parts = [...sortNodes(nodes, other), ...other.map(f => f.raw)];
+  const compactNodes = rewriteHighResolutionHead(nodes, other);
+  const parts = [...sortNodes(compactNodes, other), ...other.map(f => f.raw)];
   // Keep the large graph as chunks until the final allocation (do not decode tensors).
   const length = parts.reduce((n, p) => n + p.length, 0), result = [];
   for (const f of top) {
@@ -225,6 +313,28 @@ function adaptPinnedModel(bytes) {
     else result.push(f.raw);
   }
   return join(result);
+}
+
+// gpu-errors.mjs
+function gpuLimits(limits) {
+  const result = {};
+  for (const key of ['maxBufferSize', 'maxStorageBufferBindingSize', 'maxComputeWorkgroupsPerDimension', 'maxComputeInvocationsPerWorkgroup']) {
+    try { const value = limits?.[key]; if (Number.isFinite(value)) result[key] = value; } catch { /* Diagnostics must not hide the original error. */ }
+  }
+  return result;
+}
+function classifyGpuError(error) {
+  const detail = String(error?.message ?? error).slice(0, 4000);
+  const match = /Buffer size\s*\((\d+)\)\s*exceeds the max buffer size limit\s*\((\d+)\)/i.exec(detail);
+  if (match) {
+    const requested = Number(match[1]), limit = Number(match[2]);
+    const gib = value => (value / 1073741824).toFixed(2).replace('.', ',');
+    return { code: 'GPU_BUFFER_LIMIT', detail, buffer: { requested, limit }, message: `A böngésző egyetlen GPU-pufferre vonatkozó korlátjába ütközött a művelet: ${gib(requested)} GiB szükséges, a határ ${gib(limit)} GiB. Ez nem a videokártya teljes memóriájának elfogyását jelenti. Töltsd le a hibajelentést.` };
+  }
+  if (/maxStorageBufferBindingSize|storage buffer.*(?:exceeds|limit)|max buffer size/i.test(detail)) return { code: 'GPU_BUFFER_LIMIT', detail, message: 'A böngésző egy GPU-puffer méretkorlátja miatt állította le a számítást. A videokártya teljes memóriája ettől eltérő érték. Töltsd le a hibajelentést.' };
+  if (/device.*lost|GPUDevice.*destroyed/i.test(detail)) return { code: 'GPU_DEVICE_LOST', detail, message: 'A GPU-kapcsolat megszakadt. Frissítsd az oldalt, és ha ismétlődik, töltsd le a hibajelentést.' };
+  if (/out of memory|out of.*memory|allocation|ResourceExhausted|memory access out of bounds/i.test(detail)) return { code: 'MEMORY_ALLOCATION_FAILED', detail, message: 'Nem sikerült memóriát lefoglalni a feldolgozáshoz. Ez a böngésző vagy a GPU memóriáját is érintheti. Zárd be a nagy memóriaigényű lapokat, és ha ismétlődik, töltsd le a hibajelentést.' };
+  return { code: error?.code ?? 'INFERENCE_ERROR', detail, message: detail };
 }
 
 // worker-source.mjs
@@ -282,7 +392,7 @@ function compose(id, strength, includeRaw) {
 }
 async function run(message) {
   const { id, width, height, rgba } = message;
-  diagnostic = { appVersion: '2.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
+  diagnostic = { appVersion: '3.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', memoryOptimization: 'project-before-resize-v3', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
   report(id);
   validateSize(width, height);
   if (!(rgba instanceof ArrayBuffer) || rgba.byteLength !== width * height * 4) throw new Error('Hibás képadat érkezett.');
@@ -294,14 +404,14 @@ async function run(message) {
   // of invalid masks. Half-precision arithmetic can also overflow on some GPUs.
   const info = adapter.info;
   diagnostic.gpu = info ? { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description } : null;
-  diagnostic.shaderF16Available = adapter.features.has('shader-f16'); report(id);
+  diagnostic.shaderF16Available = adapter.features.has('shader-f16'); diagnostic.adapterLimits = gpuLimits(adapter.limits); report(id);
   const ort = await import(RUNTIME_URL);
   ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false;
   ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
   ort.env.webgpu.adapter = adapter; ort.env.webgpu.powerPreference = 'high-performance';
   ort.env.logLevel = 'error';
   let bytes = await modelBytes(id);
-  progress(id, 'Böngészős modell előkészítése…', .40);
+  progress(id, 'A HR modell memóriaigényének csökkentése…', .40);
   let compatible = adaptPinnedModel(bytes); bytes = null;
   let session, input, outputs;
   try {
@@ -310,6 +420,7 @@ async function run(message) {
     // folding; never silently replace NaN pixels or lower the model resolution.
     session = await ort.InferenceSession.create(compatible, { executionProviders: ['webgpu'], graphOptimizationLevel: 'basic', enableCpuMemArena: false, enableMemPattern: false });
     compatible = null;
+    diagnostic.deviceLimits = gpuLimits(ort.env.webgpu.device?.limits); report(id);
     if (session.inputNames.join(',') !== 'image' || session.outputNames.join(',') !== 'alpha') throw new Error('Eltérő modellbemenet vagy -kimenet.');
     const original = new OffscreenCanvas(width, height), resized = new OffscreenCanvas(MODEL_SIZE, MODEL_SIZE);
     original.getContext('2d').putImageData(new ImageData(source.data, width, height), 0, 0);
@@ -342,10 +453,9 @@ self.addEventListener('message', async ({ data }) => {
   running = true;
   try { if (data.type === 'run') await run(data); else compose(data.id, data.strength, false); }
   catch (error) {
-    const detail = String(error?.message ?? error).slice(0, 1400);
-    const memory = /memory|allocation|buffer.*size|device.*lost|out of|ResourceExhausted/i.test(detail);
-    if (diagnostic) { diagnostic.result = 'error'; diagnostic.error = { code: error?.code ?? 'INFERENCE_ERROR', message: detail, alphaStats: error?.alphaStats ?? null }; report(data.id); }
-    self.postMessage({ type: 'error', id: data.id, message: memory ? 'Az FP32 HR modellhez most nincs elég elérhető memória, vagy megszakadt a GPU-kapcsolat. Zárd be a többi képszerkesztőt és GPU-t használó lapot, majd próbáld újra.' : detail, detail });
+    const failure = classifyGpuError(error);
+    if (diagnostic) { diagnostic.result = 'error'; diagnostic.error = { code: failure.code, message: failure.detail, buffer: failure.buffer ?? null, alphaStats: error?.alphaStats ?? null }; report(data.id); }
+    self.postMessage({ type: 'error', id: data.id, message: failure.message, detail: failure.detail });
   } finally { running = false; }
 });
-self.postMessage({ type: 'ready' });
+self.postMessage({ type: 'ready', version: '3.0.0' });
