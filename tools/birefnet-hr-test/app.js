@@ -1,16 +1,18 @@
-/* PhotoCraft BiRefNet HR v1. Classic script: no local .mjs MIME dependency. */
+/* PhotoCraft BiRefNet HR v2 / FP32. Classic script: no local .mjs MIME dependency. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
   let source = null, raw = null, corrected = null, alpha = null, reference = null;
   let worker = null, ready = null, busy = false, loading = false, job = 0, loadId = 0;
   let sourceName = 'kep', clock = null, started = 0, metrics = null, appliedStrength = 0;
+  let diagnosticReport = null;
   function status(message, value) { $('status').textContent = message; if (Number.isFinite(value)) $('progress').value = value; }
   function controls() {
     $('file').disabled = busy; $('run').disabled = busy || loading || !source || !navigator.gpu || !isSecureContext;
     $('cancel').disabled = !busy; $('referenceFile').disabled = busy || loading || !source;
     $('strength').disabled = busy || !raw || !worker; $('clearCache').disabled = busy;
     $('download').disabled = $('downloadMask').disabled = busy || !raw;
+    $('downloadReport').disabled = !diagnosticReport;
   }
   function setBusy(value) {
     busy = value; clearInterval(clock);
@@ -34,9 +36,14 @@
   function removeReference() { reference = null; $('referenceFile').value = ''; $('referenceCard').hidden = true; $('comparison').classList.remove('has-reference'); $('reference').width = $('reference').height = 1; }
   function stopWorker() { worker?.terminate(); worker = null; ready = null; }
   function fail(error) { status(`Hiba: ${String(error?.message ?? error)}`, 0); setBusy(false); }
+  function showDiagnostics(report) {
+    diagnosticReport = { ...report, browser: navigator.userAgent };
+    $('diagnostics').textContent = JSON.stringify(diagnosticReport, null, 2);
+    $('downloadReport').disabled = false;
+  }
   async function getWorker() {
     if (ready) return ready;
-    const instance = new Worker('./worker.js?v=1'); worker = instance;
+    const instance = new Worker('./worker.js?v=2'); worker = instance;
     ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => { reject(new Error('A feldolgozó nem indult el. Ellenőrizd, hogy a worker.js is fel van töltve.')); }, 12000);
       instance.addEventListener('error', event => {
@@ -49,7 +56,8 @@
         if (data.id !== job) return;
         if (data.type === 'progress') status(data.message, data.value);
         else if (data.type === 'notice') { $('notice').hidden = false; $('notice').textContent = data.message; }
-        else if (data.type === 'metrics') { metrics = data; $('diagnostics').textContent = `Modell: ${data.model}\nBemenet: ${data.size} × ${data.size} px\nPontosság: ${data.precision}\nFuttatás: ${data.backend}\nModellidő: ${data.seconds.toFixed(2)} mp\nModellverzió: ${data.revision}`; }
+        else if (data.type === 'diagnostics') showDiagnostics(data.report);
+        else if (data.type === 'metrics') { metrics = data; }
         else if (data.type === 'error') { $('diagnostics').textContent += `\nHiba: ${data.detail}`; stopWorker(); fail(new Error(data.message)); }
         else if (data.type === 'result') {
           if (!source || data.width !== source.width || data.height !== source.height || data.rgba?.byteLength !== source.width * source.height * 4 || data.alpha?.byteLength !== source.width * source.height) { stopWorker(); fail(new Error('Az eredmény mérete hibás.')); return; }
@@ -75,11 +83,11 @@
   }
   $('file').addEventListener('change', async () => {
     const file = $('file').files?.[0]; if (!file || busy) return;
-    const version = ++loadId; job++; stopWorker(); loading = true; source = raw = corrected = alpha = null; metrics = null; removeReference();
+    const version = ++loadId; job++; stopWorker(); loading = true; source = raw = corrected = alpha = null; metrics = diagnosticReport = null; removeReference();
     for (const id of ['original', 'result']) $(id).width = $(id).height = 1;
     $('originalEmpty').hidden = $('resultEmpty').hidden = false; $('notice').hidden = true; $('timer').textContent = ''; started = 0;
     $('strength').value = '0'; $('strengthValue').value = '0%'; $('resultMode').value = 'raw'; appliedStrength = 0;
-    $('diagnostics').textContent = 'Modell: BiRefNet_HR-matting · 2048 × 2048 · FP16'; controls(); status('Kép betöltése…', 0);
+    $('diagnostics').textContent = 'v2 · BiRefNet_HR-matting · 2048 × 2048 · FP32'; controls(); status('Kép betöltése…', 0);
     try {
       const image = await readFile(file); if (version !== loadId) return; source = image;
       sourceName = file.name.replace(/\.[^.]+$/, '').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_') || 'kep';
@@ -90,7 +98,13 @@
   });
   $('run').addEventListener('click', async () => {
     if (busy || loading || !source) return;
-    const id = ++job; setBusy(true); $('notice').hidden = true;
+    const id = ++job;
+    // A previous successful mask must not be exported as if a failed rerun had
+    // succeeded. Preserve the source/reference, discard only derived results.
+    raw = corrected = alpha = null; metrics = diagnosticReport = null;
+    $('result').width = $('result').height = 1; $('resultEmpty').hidden = false;
+    $('diagnostics').textContent = 'v2 · FP32 feldolgozás indul…';
+    setBusy(true); $('notice').hidden = true;
     try {
       const active = await getWorker(); if (id !== job) return;
       const copy = source.data.slice();
@@ -131,8 +145,14 @@
     } catch (error) { fail(error); }
   }
   $('download').addEventListener('click', () => download(false)); $('downloadMask').addEventListener('click', () => download(true));
-  $('clearCache').addEventListener('click', async () => { if (busy) return; try { await caches.delete('photocraft-birefnet-hr-v1'); status('Modellgyorsítótár törölve. A következő futás újra letölti a modellt.'); } catch { status('A böngésző nem engedi a gyorsítótár kezelését.'); } });
+  $('downloadReport').addEventListener('click', () => {
+    if (!diagnosticReport) return;
+    const blob = new Blob([JSON.stringify(diagnosticReport, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob), link = document.createElement('a');
+    link.href = url; link.download = 'photocraft-birefnet-v2-hibajelentes.json'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+  });
+  $('clearCache').addEventListener('click', async () => { if (busy) return; try { await caches.delete('photocraft-birefnet-hr-v1'); await caches.delete('photocraft-birefnet-hr-fp32-v2'); status('Modellgyorsítótár törölve. A következő futás újra letölti az FP32 modellt.'); } catch { status('A böngésző nem engedi a gyorsítótár kezelését.'); } });
   window.addEventListener('pagehide', () => { stopWorker(); clearInterval(clock); });
-  $('gpu').textContent = !isSecureContext ? 'HTTPS címen nyisd meg ezt az oldalt. Helyi teszthez localhost használható.' : !navigator.gpu ? 'WebGPU nem érhető el. Próbáld asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással.' : 'Első futás: kb. 470 MB modellletöltés. A HR feldolgozás a saját videokártyádon fut; nagyobb memóriaigényű a BEN2 változatnál.';
+  $('gpu').textContent = !isSecureContext ? 'HTTPS címen nyisd meg ezt az oldalt. Helyi teszthez localhost használható.' : !navigator.gpu ? 'WebGPU nem érhető el. Próbáld asztali Chrome, Edge vagy Opera böngészőben, bekapcsolt hardveres gyorsítással.' : 'v2 · FP32 számítás. Első futás: kb. 932 MB modellletöltés. A feldolgozás a saját videokártyádon fut; több memóriát használ, mint az előző FP16 változat.';
   controls(); document.documentElement.dataset.appReady = '1'; status('Válaszd ki az eredeti fotót.', 0);
 })();

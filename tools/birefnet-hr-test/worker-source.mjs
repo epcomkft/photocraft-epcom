@@ -3,15 +3,19 @@ import { composeCutout } from './edge-colors.mjs';
 import { adaptPinnedModel } from './onnx-compat.mjs';
 
 const MODEL_REV = '792518b9d4dfe9793891712677de25e554f948c6';
-const MODEL_URL = `https://huggingface.co/PinkPixel/birefnet-hr-matting-onnx/resolve/${MODEL_REV}/model_fp16.onnx`;
-const MODEL_BYTES = 471320622;
-const MODEL_HASH = 'c0216070c15542b7197bcf13eb3ea07af0fc5595c591037b7c9766c3cc6470f0';
-const CACHE_NAME = 'photocraft-birefnet-hr-v1';
+// Use the publisher's actual FP32 reference, not FP16 weights cast back to FP32.
+const MODEL_URL = `https://huggingface.co/PinkPixel/birefnet-hr-matting-onnx/resolve/${MODEL_REV}/model.onnx`;
+const MODEL_BYTES = 932150975;
+const MODEL_HASH = 'a548a1f3307250766bef50b174026b3cfa39a695bc1e42ec131c14fe82797ffd';
+const CACHE_NAME = 'photocraft-birefnet-hr-fp32-v2';
 const RUNTIME_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.webgpu.min.mjs';
-let source = null, matte = null, running = false;
-function progress(id, message, value) { self.postMessage({ type: 'progress', id, message, value }); }
+let source = null, matte = null, running = false, diagnostic = null;
+function progress(id, message, value) { if (diagnostic) diagnostic.stage = message; self.postMessage({ type: 'progress', id, message, value }); }
+function report(id) { self.postMessage({ type: 'diagnostics', id, report: diagnostic }); }
 async function modelBytes(id) {
   let cache = null, response = null;
+  // The v1 FP16 download cannot be reused for FP32. Free its browser storage.
+  try { await caches.delete('photocraft-birefnet-hr-v1'); } catch { /* Optional cache. */ }
   try { cache = await caches.open(CACHE_NAME); response = await cache.match(MODEL_URL); } catch { /* Cache is optional (private mode / quota). */ }
   const cached = !!response;
   if (!response) response = await fetch(MODEL_URL, { credentials: 'omit', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(600_000) });
@@ -26,7 +30,7 @@ async function modelBytes(id) {
       if (offset + next.value.length > data.length) throw new Error('A letöltött modell mérete eltér a várt változattól.');
       data.set(next.value, offset); offset += next.value.length;
       if (performance.now() - last > 150) {
-        progress(id, `${cached ? 'Modell a gyorsítótárból' : 'Modell letöltése'}: ${Math.round(offset / 1e6)} / 471 MB`, .04 + .32 * offset / data.length); last = performance.now();
+        progress(id, `${cached ? 'FP32 modell a gyorsítótárból' : 'FP32 modell letöltése'}: ${Math.round(offset / 1e6)} / ${Math.round(MODEL_BYTES / 1e6)} MB`, .04 + .32 * offset / data.length); last = performance.now();
       }
     }
   } catch (error) { await reader.cancel().catch(() => {}); throw error; }
@@ -52,13 +56,19 @@ function compose(id, strength, includeRaw) {
 }
 async function run(message) {
   const { id, width, height, rgba } = message;
+  diagnostic = { appVersion: '2.0.0', model: 'BiRefNet_HR-matting', revision: MODEL_REV, file: 'model.onnx', sha256: MODEL_HASH, precision: 'FP32', runtime: 'onnxruntime-web 1.23.2', backend: 'WebGPU', graphOptimization: 'basic', inputSize: [MODEL_SIZE, MODEL_SIZE], sourceSize: [width, height] };
+  report(id);
   validateSize(width, height);
   if (!(rgba instanceof ArrayBuffer) || rgba.byteLength !== width * height * 4) throw new Error('Hibás képadat érkezett.');
   source = { data: new Uint8ClampedArray(rgba), width, height, channels: 4 }; matte = null;
   progress(id, 'Videokártya ellenőrzése…', .01);
   const adapter = await self.navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('Nem érhető el WebGPU. Asztali Chrome, Edge vagy Opera böngészőben, HTTPS alatt, bekapcsolt hardveres gyorsítással próbáld.');
-  if (!adapter.features.has('shader-f16')) throw new Error('Ez a videokártya vagy böngésző nem támogatja a HR modell FP16 futtatását. Frissítsd a böngészőt és a videokártya illesztőprogramját.');
+  // FP32 does not require shader-f16; unsupported FP16 was not the only source
+  // of invalid masks. Half-precision arithmetic can also overflow on some GPUs.
+  const info = adapter.info;
+  diagnostic.gpu = info ? { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description } : null;
+  diagnostic.shaderF16Available = adapter.features.has('shader-f16'); report(id);
   const ort = await import(RUNTIME_URL);
   ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false;
   ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
@@ -70,7 +80,9 @@ async function run(message) {
   let session, input, outputs;
   try {
     progress(id, 'HR modell betöltése a videokártyára…', .46);
-    session = await ort.InferenceSession.create(compatible, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all', enableCpuMemArena: false, enableMemPattern: false });
+    // Avoid extended/all fusions as well as FP16 arithmetic. Keep basic constant
+    // folding; never silently replace NaN pixels or lower the model resolution.
+    session = await ort.InferenceSession.create(compatible, { executionProviders: ['webgpu'], graphOptimizationLevel: 'basic', enableCpuMemArena: false, enableMemPattern: false });
     compatible = null;
     if (session.inputNames.join(',') !== 'image' || session.outputNames.join(',') !== 'alpha') throw new Error('Eltérő modellbemenet vagy -kimenet.');
     const original = new OffscreenCanvas(width, height), resized = new OffscreenCanvas(MODEL_SIZE, MODEL_SIZE);
@@ -82,13 +94,16 @@ async function run(message) {
     ctx.drawImage(original, 0, 0, MODEL_SIZE, MODEL_SIZE);
     input = new ort.Tensor('float32', normalizeRgb(ctx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data, MODEL_SIZE, MODEL_SIZE), [1, 3, MODEL_SIZE, MODEL_SIZE]);
     original.width = original.height = resized.width = resized.height = 1;
-    progress(id, 'BiRefNet HR-matting dolgozik · 2048 × 2048 px…', .60);
+    progress(id, 'BiRefNet HR-matting dolgozik · FP32 · 2048 × 2048 px…', .60);
     const start = performance.now(); outputs = await session.run({ image: input });
     const seconds = (performance.now() - start) / 1000;
+    diagnostic.seconds = seconds;
+    diagnostic.output = { type: outputs.alpha?.type, dims: outputs.alpha?.dims, length: outputs.alpha?.data?.length };
     const floats = readModelAlpha(outputs.alpha);
     progress(id, 'Eredeti képméret és átlátszóság visszaállítása…', .92);
     matte = resizeAlpha(floats, MODEL_SIZE, MODEL_SIZE, width, height);
-    self.postMessage({ type: 'metrics', id, seconds, model: 'BiRefNet_HR-matting', revision: MODEL_REV, size: MODEL_SIZE, precision: 'FP16 / FP32 I/O', backend: 'WebGPU' });
+    diagnostic.result = 'valid'; report(id);
+    self.postMessage({ type: 'metrics', id, seconds, model: 'BiRefNet_HR-matting', revision: MODEL_REV, size: MODEL_SIZE, precision: 'FP32', backend: 'WebGPU' });
   } finally {
     input?.dispose(); for (const output of Object.values(outputs ?? {})) output?.dispose();
     await session?.release();
@@ -103,7 +118,8 @@ self.addEventListener('message', async ({ data }) => {
   catch (error) {
     const detail = String(error?.message ?? error).slice(0, 1400);
     const memory = /memory|allocation|buffer.*size|device.*lost|out of|ResourceExhausted/i.test(detail);
-    self.postMessage({ type: 'error', id: data.id, message: memory ? 'A HR modellhez most nincs elég elérhető memória, vagy megszakadt a GPU-kapcsolat. Zárd be a többi képszerkesztőt és GPU-t használó lapot, majd próbáld újra.' : detail, detail });
+    if (diagnostic) { diagnostic.result = 'error'; diagnostic.error = { code: error?.code ?? 'INFERENCE_ERROR', message: detail, alphaStats: error?.alphaStats ?? null }; report(data.id); }
+    self.postMessage({ type: 'error', id: data.id, message: memory ? 'Az FP32 HR modellhez most nincs elég elérhető memória, vagy megszakadt a GPU-kapcsolat. Zárd be a többi képszerkesztőt és GPU-t használó lapot, majd próbáld újra.' : detail, detail });
   } finally { running = false; }
 });
 self.postMessage({ type: 'ready' });

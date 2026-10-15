@@ -1,4 +1,4 @@
-// Narrow, zero-copy protobuf traversal for the pinned PinkPixel export only.
+// Narrow, zero-copy protobuf traversal for the pinned PinkPixel FP32 export only.
 // ORT WebGPU 1.23.2 supports GridSample 16-19 (2D bilinear), not opset 20
 // (renames this mode 'linear'). Map exact GELU to the equivalent Microsoft op.
 // Initializers are retained byte-for-byte. No weights or inference precision change.
@@ -35,8 +35,7 @@ function str(id, text) { return field(id, encode.encode(text)); }
 function num(id, n) { return join([vint(id * 8), vint(n)]); }
 function textField(list, id) { const f = list.find(f => f.id === id); return f ? utf8.decode(f.data) : ''; }
 function sortNodes(nodes, other) {
-  // The published FP16 converter appends Cast nodes after their consumers.
-  // Sort them so the adapted file also passes the strict ONNX checker.
+  // Preserve dependency order explicitly. This also rejects broken/cyclic graphs.
   const producers = new Map(), sources = new Set();
   for (const f of other) {
     if (f.id === 11) sources.add(textField(fields(f.data), 1));

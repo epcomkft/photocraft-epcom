@@ -23,16 +23,28 @@ export function normalizeRgb(rgba, width, height) {
   return out;
 }
 export function readModelAlpha(tensor) {
-  if (tensor?.type !== 'float32' || tensor.dims?.join(',') !== '1,1,2048,2048' || tensor.data?.length !== MODEL_SIZE * MODEL_SIZE) {
+  if (tensor?.type !== 'float32' || tensor.dims?.join(',') !== '1,1,2048,2048' || !(tensor.data instanceof Float32Array) || tensor.data.length !== MODEL_SIZE * MODEL_SIZE) {
     throw new Error('A HR modell kimenetének típusa vagy mérete hibás.');
   }
   // The pinned export ALREADY includes Sigmoid. Applying it twice destroys alpha.
-  const out = new Float32Array(tensor.data.length);
-  for (let i = 0; i < out.length; i++) {
-    const v = tensor.data[i];
-    if (!Number.isFinite(v) || v < -.01 || v > 1.01) throw new Error('A modell érvénytelen átlátszósági értéket adott.');
-    out[i] = clamp(v, 0, 1);
+  // Invalid output must never be changed to transparent/opaque pixels to hide a
+  // failed GPU inference. Collect the entire failure, then reject atomically.
+  const stats = { total: tensor.data.length, nan: 0, infinite: 0, outOfRange: 0, invalid: 0, min: null, max: null, firstInvalidIndex: null };
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < tensor.data.length; i++) {
+    const v = tensor.data[i]; let bad = false;
+    if (Number.isNaN(v)) { stats.nan++; bad = true; }
+    else if (!Number.isFinite(v)) { stats.infinite++; bad = true; }
+    else { min = Math.min(min, v); max = Math.max(max, v); if (v < -1e-6 || v > 1 + 1e-6) { stats.outOfRange++; bad = true; } }
+    if (bad) { stats.invalid++; if (stats.firstInvalidIndex === null) stats.firstInvalidIndex = i; }
   }
+  stats.min = Number.isFinite(min) ? min : null; stats.max = Number.isFinite(max) ? max : null;
+  if (stats.invalid) {
+    const error = new Error(`A GPU számítása érvénytelen alfamaszkot adott (${stats.invalid} / ${stats.total} hibás képpont). A hibajelentés a „Peremtisztítás és ellenőrzés” részből letölthető.`);
+    error.code = 'MODEL_ALPHA_INVALID'; error.alphaStats = stats; throw error;
+  }
+  const out = new Float32Array(tensor.data.length);
+  for (let i = 0; i < out.length; i++) out[i] = clamp(tensor.data[i], 0, 1);
   return out;
 }
 export function resizeAlpha(alpha, sw, sh, width, height) {

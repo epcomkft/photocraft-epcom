@@ -33,8 +33,28 @@ const server=http.createServer((req,res)=>{const file=path.join(root,req.url.spl
     await page.locator('#run').click();await page.locator('#cancel').click();await page.waitForTimeout(500);assert.match(await page.locator('#status').textContent(),/Megszakítva/);assert.equal(await page.locator('#run').isEnabled(),true);
     await page.locator('#file').setInputFiles({name:'bad.txt',mimeType:'text/plain',buffer:Buffer.from('not an image')});await page.waitForFunction(()=>document.getElementById('status').textContent.includes('JPG'));
     assert.equal(await page.locator('#run').isDisabled(),true);assert.equal(await page.locator('#download').isDisabled(),true);
+    // Simulate a GPU numerical failure after a prior successful result. Check
+    // that the old mask is not still offered for download, and save diagnostics.
+    await page.setViewportSize({width:1440,height:1100});
+    await page.locator('#file').setInputFiles({name:'private-photo.png',mimeType:'image/png',buffer:fixture(800,600)});
+    await page.waitForFunction(()=>!document.getElementById('run').disabled);
+    await page.locator('#run').click();await page.waitForFunction(()=>!document.getElementById('download').disabled);
+    await page.locator('#run').click();await page.locator('#cancel').click();
+    assert.equal(await page.locator('#download').isDisabled(),true);
+    await page.route('**/worker.js*',r=>r.fulfill({contentType:'application/javascript',body:`self.postMessage({type:'ready'});self.onmessage=({data:m})=>{self.postMessage({type:'diagnostics',id:m.id,report:{appVersion:'2.0.0',precision:'FP32',error:{code:'MODEL_ALPHA_INVALID',alphaStats:{nan:4194304}}}});self.postMessage({type:'error',id:m.id,message:'A GPU számítása érvénytelen alfamaszkot adott.',detail:'fixture NaN failure'});};`}));
+    await page.locator('#run').click();await page.waitForFunction(()=>document.getElementById('status').textContent.includes('érvénytelen'));
+    assert.equal(await page.locator('#download').isDisabled(),true);assert.equal(await page.locator('#downloadMask').isDisabled(),true);
+    assert.equal(await page.locator('#run').isEnabled(),true);assert.equal(await page.locator('#file').isEnabled(),true);
+    assert.equal(await page.locator('#resultEmpty').isVisible(),true);
+    await page.locator('summary').click();
+    const [report]=await Promise.all([page.waitForEvent('download'),page.locator('#downloadReport').click()]);
+    assert.equal(report.suggestedFilename(),'photocraft-birefnet-v2-hibajelentes.json');
+    const reportText=fs.readFileSync(await report.path(),'utf8');assert.equal(JSON.parse(reportText).error.alphaStats.nan,4194304);assert.equal(reportText.includes('private-photo'),false);
+    if(shots)await page.screenshot({path:path.join(shots,'error-report.png'),fullPage:true});
+    await page.setViewportSize({width:390,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    if(shots)await page.screenshot({path:path.join(shots,'error-mobile.png'),fullPage:true});
     assert.deepEqual(errors,[]);
     const failed=await browser.newPage();await failed.route('**/app.js*',r=>r.abort());await failed.goto(`http://127.0.0.1:${server.address().port}/`);await failed.waitForFunction(()=>document.getElementById('status').textContent.includes('nem indult'));assert.equal(await failed.locator('#file').isDisabled(),true);
-    console.log('PASS: browser startup, upload, result, preview, reference validation, cleanup, PNG export, responsive layout, cancellation, invalid upload, missing app.js. GPU outputs mocked.');
+    console.log('PASS: browser startup, upload, result, preview, reference validation, cleanup, PNG export, responsive layout, cancellation, invalid upload, missing app.js, GPU-error retry, no stale export, JSON report. GPU outputs mocked.');
   }finally{await browser?.close();server.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

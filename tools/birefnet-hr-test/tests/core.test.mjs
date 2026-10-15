@@ -19,6 +19,13 @@ test('model alpha is already sigmoid; only finite [0,1] floats are accepted', ()
   t.data[10]=NaN;assert.throws(()=>readModelAlpha(t));
   assert.throws(()=>readModelAlpha({...t,dims:[1,1,1024,1024]}));
 });
+test('a wholly invalid output is rejected with JSON-safe stats; no NaN-to-zero masking', () => {
+  const t={type:'float32',dims:[1,1,2048,2048],data:new Float32Array(2048*2048).fill(NaN)};
+  assert.throws(()=>readModelAlpha(t), e => e.code==='MODEL_ALPHA_INVALID' && e.alphaStats.invalid===4194304 && e.alphaStats.min===null && e.alphaStats.max===null);
+  t.data.fill(.5); t.data[0]=-1e-8; t.data[1]=1+1e-7;
+  const out=readModelAlpha(t); assert.equal(out[0],0);assert.equal(out[1],1);assert.equal(out[2],.5);
+  t.data[5]=1.005;assert.throws(()=>readModelAlpha(t),e=>e.alphaStats.outOfRange===1);
+});
 test('original PNG alpha is multiplied, not replaced', () => {
   const src={width:2,height:1,channels:4,data:Uint8ClampedArray.from([80,90,100,128,20,30,40,0])};
   const out=composeCutout(src,mask(Uint8ClampedArray.from([128,255]),2,1),0);
